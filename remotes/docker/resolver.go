@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path"
@@ -591,7 +592,23 @@ func (r *request) do(ctx context.Context) (*http.Response, error) {
 
 	tracing.UpdateHTTPClient(client, tracing.Name("remotes.docker.resolver", "HTTPRequest"))
 
+	reqDump, err := httputil.DumpRequestOut(req, true)
+	if err != nil {
+		log.G(ctx).WithError(err).Info("failed to pretty print HTTP req")
+	} else {
+		log.G(ctx).Infof("Dumping HTTP request")
+		log.G(ctx).Infof("%s", reqDump)
+	}
 	resp, err := client.Do(req)
+	if resp != nil {
+		respDump, err := httputil.DumpResponse(resp, true)
+		if err != nil {
+			log.G(ctx).WithError(err).Info("failed to pretty print HTTP resp")
+		} else {
+			log.G(ctx).Infof("Dumping HTTP response")
+			log.G(ctx).Infof("%s", respDump)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to do request: %w", err)
 	}
