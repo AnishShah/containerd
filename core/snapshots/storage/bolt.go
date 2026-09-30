@@ -21,6 +21,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -38,11 +40,13 @@ var (
 	bucketKeySnapshot       = []byte("snapshots")
 	bucketKeyParents        = []byte("parents")
 
-	bucketKeyID     = []byte("id")
-	bucketKeyParent = []byte("parent")
-	bucketKeyKind   = []byte("kind")
-	bucketKeyInodes = []byte("inodes")
-	bucketKeySize   = []byte("size")
+	bucketKeyID         = []byte("id")
+	bucketKeyParent     = []byte("parent")
+	bucketKeyKind       = []byte("kind")
+	bucketKeyInodes     = []byte("inodes")
+	bucketKeySize       = []byte("size")
+	bucketKeySourceRoot = []byte("source_root")
+	bucketKeySourceID   = []byte("source_id")
 
 	// ErrNoTransaction is returned when an operation is attempted with
 	// a context which is not inside of a transaction.
@@ -74,24 +78,79 @@ func getParentPrefix(b []byte) uint64 {
 }
 
 // GetInfo returns the snapshot Info directly from the metadata. Requires a
-// context with a storage transaction.
+// context with a storage transaction. For snapshots imported from a secondary
+// root via PutCommittedSnapshot or PutCommittedSnapshots, the returned storage
+// ID is the path to the snapshot directory under that secondary root
+// (<sourceRoot>/snapshots/<id>).
 func GetInfo(ctx context.Context, key string) (string, snapshots.Info, snapshots.Usage, error) {
 	var (
-		id uint64
-		su snapshots.Usage
-		si = snapshots.Info{
+		storageID string
+		su        snapshots.Usage
+		si        = snapshots.Info{
 			Name: key,
 		}
 	)
 	err := withSnapshotBucket(ctx, key, func(ctx context.Context, bkt, pbkt *bolt.Bucket) error {
 		getUsage(bkt, &su)
-		return readSnapshot(bkt, &id, &si)
+		storageID = readStorageID(bkt)
+		return readSnapshot(bkt, nil, &si)
 	})
 	if err != nil {
 		return "", snapshots.Info{}, snapshots.Usage{}, err
 	}
 
-	return strconv.FormatUint(id, 10), si, su, nil
+	return storageID, si, su, nil
+}
+
+// WalkStoragePaths walks the storage IDs for key and its ancestors until an ancestor
+// already present in visitedKeys is reached. Requires a context with a storage transaction.
+func WalkStoragePaths(ctx context.Context, key string, visitedKeys map[string]error, check func(storageID string) error) error {
+	if visitedKeys != nil {
+		if err, ok := visitedKeys[key]; ok {
+			return err
+		}
+	}
+	return withBucket(ctx, func(ctx context.Context, bkt, _ *bolt.Bucket) error {
+		if bkt == nil {
+			return fmt.Errorf("snapshots bucket does not exist: %w", errdefs.ErrNotFound)
+		}
+		var (
+			chain    []string
+			chainErr error
+			curr     = key
+			seen     = map[string]bool{}
+		)
+		for curr != "" && !seen[curr] {
+			seen[curr] = true
+			if visitedKeys != nil {
+				if err, ok := visitedKeys[curr]; ok {
+					chainErr = err
+					break
+				}
+				chain = append(chain, curr)
+			}
+			sbkt := bkt.Bucket([]byte(curr))
+			if sbkt == nil {
+				if curr == key {
+					chainErr = fmt.Errorf("snapshot does not exist: %w", errdefs.ErrNotFound)
+				} else {
+					chainErr = fmt.Errorf("missing parent: %w", errdefs.ErrNotFound)
+				}
+				break
+			}
+			if err := check(readStorageID(sbkt)); err != nil {
+				chainErr = err
+				break
+			}
+			curr = string(sbkt.Get(bucketKeyParent))
+		}
+		if visitedKeys != nil {
+			for _, k := range chain {
+				visitedKeys[k] = chainErr
+			}
+		}
+		return chainErr
+	})
 }
 
 // UpdateInfo updates an existing snapshot info's data
@@ -179,6 +238,8 @@ func WalkInfo(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
 
 // GetSnapshot returns the metadata for the active or view snapshot transaction
 // referenced by the given key. Requires a context with a storage transaction.
+// Any parent snapshots imported from a secondary root are represented in
+// ParentIDs by their secondary-root snapshot directory path (<sourceRoot>/snapshots/<id>).
 func GetSnapshot(ctx context.Context, key string) (s Snapshot, err error) {
 	err = withBucket(ctx, func(ctx context.Context, bkt, pbkt *bolt.Bucket) error {
 		sbkt := bkt.Bucket([]byte(key))
@@ -186,7 +247,7 @@ func GetSnapshot(ctx context.Context, key string) (s Snapshot, err error) {
 			return fmt.Errorf("snapshot does not exist: %w", errdefs.ErrNotFound)
 		}
 
-		s.ID = strconv.FormatUint(readID(sbkt), 10)
+		s.ID = readStorageID(sbkt)
 		s.Kind = readKind(sbkt)
 
 		if s.Kind != snapshots.KindActive && s.Kind != snapshots.KindView {
@@ -214,6 +275,8 @@ func GetSnapshot(ctx context.Context, key string) (s Snapshot, err error) {
 }
 
 // CreateSnapshot inserts a record for an active or view snapshot with the provided parent.
+// Any parent snapshots imported from a secondary root are represented in ParentIDs
+// by their secondary-root snapshot directory path (<sourceRoot>/snapshots/<id>).
 func CreateSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts ...snapshots.Opt) (s Snapshot, err error) {
 	switch kind {
 	case snapshots.KindActive, snapshots.KindView:
@@ -297,8 +360,9 @@ func CreateSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string
 // writable transaction.
 func Remove(ctx context.Context, key string) (string, snapshots.Kind, error) {
 	var (
-		id uint64
-		si snapshots.Info
+		id        uint64
+		storageID string
+		si        snapshots.Info
 	)
 
 	if err := withBucket(ctx, func(ctx context.Context, bkt, pbkt *bolt.Bucket) error {
@@ -307,6 +371,7 @@ func Remove(ctx context.Context, key string) (string, snapshots.Kind, error) {
 			return fmt.Errorf("snapshot %v: %w", key, errdefs.ErrNotFound)
 		}
 
+		storageID = readStorageID(sbkt)
 		if err := readSnapshot(sbkt, &id, &si); err != nil {
 			return fmt.Errorf("failed to read snapshot %s: %w", key, err)
 		}
@@ -338,7 +403,51 @@ func Remove(ctx context.Context, key string) (string, snapshots.Kind, error) {
 		return "", 0, err
 	}
 
-	return strconv.FormatUint(id, 10), si.Kind, nil
+	return storageID, si.Kind, nil
+}
+
+// RemoveHierarchy removes a snapshot and any of its descendants from the metastore,
+// returning the primary-root storage IDs that were removed.
+func RemoveHierarchy(ctx context.Context, key string) ([]string, error) {
+	var removedIDs []string
+	err := withBucket(ctx, func(ctx context.Context, bkt, pbkt *bolt.Bucket) error {
+		return removeHierarchy(bkt, pbkt, key, &removedIDs)
+	})
+	if err != nil && !errdefs.IsNotFound(err) {
+		return nil, err
+	}
+	return removedIDs, nil
+}
+
+func removeHierarchy(bkt, pbkt *bolt.Bucket, key string, removedIDs *[]string) error {
+	sbkt := bkt.Bucket([]byte(key))
+	if sbkt == nil {
+		return nil
+	}
+	id := readID(sbkt)
+	parent := string(sbkt.Get(bucketKeyParent))
+
+	if pbkt != nil {
+		var children []string
+		c := pbkt.Cursor()
+		for k, v := c.Seek(parentPrefixKey(id)); k != nil && getParentPrefix(k) == id; k, v = c.Next() {
+			children = append(children, string(v))
+		}
+		for _, child := range children {
+			if err := removeHierarchy(bkt, pbkt, child, removedIDs); err != nil {
+				return err
+			}
+		}
+		if parent != "" {
+			if spbkt := bkt.Bucket([]byte(parent)); spbkt != nil {
+				_ = pbkt.Delete(parentKey(readID(spbkt), id))
+			}
+		}
+	}
+	if removedIDs != nil && len(sbkt.Get(bucketKeySourceRoot)) == 0 && id > 0 {
+		*removedIDs = append(*removedIDs, strconv.FormatUint(id, 10))
+	}
+	return bkt.DeleteBucket([]byte(key))
 }
 
 // CommitActive renames the active snapshot transaction referenced by `key`
@@ -430,7 +539,170 @@ func CommitActive(ctx context.Context, key, name string, usage snapshots.Usage, 
 	return strconv.FormatUint(id, 10), nil
 }
 
-// IDMap returns all the IDs mapped to their key
+// PutCommittedSnapshot inserts or updates an imported committed snapshot from a secondary root.
+func PutCommittedSnapshot(ctx context.Context, key string, info snapshots.Info, usage snapshots.Usage, sourceRoot, sourceID string) (string, error) {
+	var storageID string
+	err := createBucketIfNotExists(ctx, func(ctx context.Context, bkt, pbkt *bolt.Bucket) error {
+		var spbkt *bolt.Bucket
+		if info.Parent != "" {
+			spbkt = bkt.Bucket([]byte(info.Parent))
+			if spbkt == nil {
+				return fmt.Errorf("missing parent %q bucket: %w", info.Parent, errdefs.ErrNotFound)
+			}
+			if readKind(spbkt) != snapshots.KindCommitted {
+				return fmt.Errorf("parent %q is not committed snapshot: %w", info.Parent, errdefs.ErrInvalidArgument)
+			}
+		}
+
+		var id uint64
+		sbkt := bkt.Bucket([]byte(key))
+		if sbkt == nil {
+			var err error
+			sbkt, err = bkt.CreateBucket([]byte(key))
+			if err != nil {
+				return err
+			}
+			id, err = bkt.NextSequence()
+			if err != nil {
+				return fmt.Errorf("unable to get identifier for snapshot %q: %w", key, err)
+			}
+		} else {
+			id = readID(sbkt)
+			oldParent := string(sbkt.Get(bucketKeyParent))
+			if oldParent != info.Parent && oldParent != "" {
+				if oldPBkt := bkt.Bucket([]byte(oldParent)); oldPBkt != nil {
+					_ = pbkt.Delete(parentKey(readID(oldPBkt), id))
+				}
+			}
+		}
+
+		info.Kind = snapshots.KindCommitted
+		if info.Created.IsZero() {
+			info.Created = time.Now().UTC()
+		}
+		if info.Updated.IsZero() {
+			info.Updated = info.Created
+		}
+		if info.Parent == "" {
+			_ = sbkt.Delete(bucketKeyParent)
+		}
+		if err := putSnapshot(sbkt, id, info); err != nil {
+			return err
+		}
+		if err := putUsage(sbkt, usage); err != nil {
+			return err
+		}
+		if sourceRoot != "" && sourceID != "" {
+			if err := sbkt.Put(bucketKeySourceRoot, []byte(sourceRoot)); err != nil {
+				return err
+			}
+			if err := sbkt.Put(bucketKeySourceID, []byte(sourceID)); err != nil {
+				return err
+			}
+		} else {
+			_ = sbkt.Delete(bucketKeySourceRoot)
+			_ = sbkt.Delete(bucketKeySourceID)
+		}
+		if spbkt != nil {
+			pid := readID(spbkt)
+			if err := pbkt.Put(parentKey(pid, id), []byte(key)); err != nil {
+				return fmt.Errorf("failed to write parent link for snapshot %q: %w", key, err)
+			}
+		}
+		storageID = readStorageID(sbkt)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return storageID, nil
+}
+
+// CommittedSnapshotImport describes a committed snapshot to import from a secondary root.
+type CommittedSnapshotImport struct {
+	Key        string
+	Info       snapshots.Info
+	Usage      snapshots.Usage
+	SourceRoot string
+	SourceID   string
+}
+
+// SecondarySnapshot holds metadata for a committed snapshot read from a secondary root's metadata.db.
+type SecondarySnapshot struct {
+	ID    string
+	Info  snapshots.Info
+	Usage snapshots.Usage
+}
+
+// ReadSecondarySnapshots opens a secondary root's snapshotter metadata.db in read-only mode
+// and returns all committed snapshots keyed by their snapshot name (bkey).
+func ReadSecondarySnapshots(dbFile string) (map[string]SecondarySnapshot, error) {
+	st, err := os.Stat(dbFile)
+	if err != nil {
+		return nil, err
+	}
+	if st.IsDir() || st.Size() == 0 {
+		return map[string]SecondarySnapshot{}, nil
+	}
+	opts := *bolt.DefaultOptions
+	opts.ReadOnly = true
+	opts.NoStatistics = true
+	opts.Timeout = time.Second
+	db, err := bolt.Open(dbFile, 0600, &opts)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	result := map[string]SecondarySnapshot{}
+	err = db.View(func(tx *bolt.Tx) error {
+		vbkt := tx.Bucket(bucketKeyStorageVersion)
+		if vbkt == nil {
+			return nil
+		}
+		bkt := vbkt.Bucket(bucketKeySnapshot)
+		if bkt == nil {
+			return nil
+		}
+		return bkt.ForEach(func(k, v []byte) error {
+			if v != nil {
+				return nil
+			}
+			sbkt := bkt.Bucket(k)
+			if sbkt == nil {
+				return nil
+			}
+			var (
+				id uint64
+				si = snapshots.Info{
+					Name: string(k),
+				}
+				su snapshots.Usage
+			)
+			if err := readSnapshot(sbkt, &id, &si); err != nil {
+				return err
+			}
+			if si.Kind != snapshots.KindCommitted {
+				return nil
+			}
+			getUsage(sbkt, &su)
+			result[string(k)] = SecondarySnapshot{
+				ID:    strconv.FormatUint(id, 10),
+				Info:  si,
+				Usage: su,
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// IDMap returns all the primary root IDs mapped to their key. Snapshots
+// imported from a secondary root are excluded because their storage resides
+// outside the primary snapshotter root.
 func IDMap(ctx context.Context) (map[string]string, error) {
 	m := map[string]string{}
 	if err := withBucket(ctx, func(ctx context.Context, bkt, _ *bolt.Bucket) error {
@@ -439,7 +711,11 @@ func IDMap(ctx context.Context) (map[string]string, error) {
 			if v != nil {
 				return nil
 			}
-			id := readID(bkt.Bucket(k))
+			sbkt := bkt.Bucket(k)
+			if len(sbkt.Get(bucketKeySourceRoot)) > 0 {
+				return nil
+			}
+			id := readID(sbkt)
 			m[strconv.FormatUint(id, 10)] = string(k)
 			return nil
 		})
@@ -506,7 +782,7 @@ func createBucketIfNotExists(ctx context.Context, fn func(context.Context, *bolt
 
 func parents(bkt, pbkt *bolt.Bucket, parent uint64) (parents []string, err error) {
 	for {
-		parents = append(parents, strconv.FormatUint(parent, 10))
+		parents = append(parents, readStorageID(pbkt))
 
 		parentKey := pbkt.Get(bucketKeyParent)
 		if len(parentKey) == 0 {
@@ -532,6 +808,15 @@ func readKind(bkt *bolt.Bucket) (k snapshots.Kind) {
 func readID(bkt *bolt.Bucket) uint64 {
 	id, _ := binary.Uvarint(bkt.Get(bucketKeyID))
 	return id
+}
+
+func readStorageID(bkt *bolt.Bucket) string {
+	if sr := bkt.Get(bucketKeySourceRoot); len(sr) > 0 {
+		if sid := bkt.Get(bucketKeySourceID); len(sid) > 0 {
+			return filepath.Join(string(sr), "snapshots", string(sid))
+		}
+	}
+	return strconv.FormatUint(readID(bkt), 10)
 }
 
 func readSnapshot(bkt *bolt.Bucket, id *uint64, si *snapshots.Info) error {

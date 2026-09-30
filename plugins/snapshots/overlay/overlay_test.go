@@ -34,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/userns"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	"github.com/containerd/containerd/v2/plugins/snapshots/overlay/overlayutils"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -827,5 +828,185 @@ func testOverlayView(t *testing.T, newSnapshotter testsuite.SnapshotterFunc) {
 
 	if m.Options[1] != "volatile" {
 		t.Error("expected option first option to be provided option \"volatile\"")
+	}
+}
+
+func TestOverlaySecondaryRoots(t *testing.T) {
+	ctx := t.Context()
+	primaryRoot := t.TempDir()
+	secRoot := t.TempDir()
+
+	// 1. Populate secondary root snapshotter with two committed layers ("base" -> "top")
+	secSn, err := NewSnapshotter(secRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mounts, err := secSn.Prepare(ctx, "prep-base", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mounts[0].Source, "base.txt"), []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := secSn.Commit(ctx, "base", "prep-base"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := secSn.Prepare(ctx, "prep-top", "base"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secRoot, "snapshots", "2", "fs", "top.txt"), []byte("top"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := secSn.Commit(ctx, "top", "prep-top"); err != nil {
+		t.Fatal(err)
+	}
+	if err := secSn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Read secondary snapshots and import them into primary snapshotter
+	records, err := storage.ReadSecondarySnapshots(filepath.Join(secRoot, "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records from secondary root, got %d", len(records))
+	}
+
+	priSn, err := NewSnapshotter(primaryRoot, WithSecondaryRoots([]string{secRoot}), WithUpperdirLabel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer priSn.Close()
+
+	importer := priSn.(*snapshotter)
+	for _, rec := range records {
+		if !importer.SnapshotDirExists(secRoot, rec.ID) {
+			t.Fatalf("expected snapshot dir for ID %s to exist in secondary root", rec.ID)
+		}
+	}
+	// Import in parent-first order ("base" then "top")
+	for _, key := range []string{"base", "top"} {
+		for _, rec := range records {
+			if rec.Info.Name == key {
+				if err := importer.ImportCommittedSnapshot(ctx, rec.Info.Name, rec.Info, rec.Usage, secRoot, rec.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+
+	// Verify WithUpperdirLabel populates containerd.io/snapshot/overlay.upperdir with <secRoot>/snapshots/<id>/fs
+	baseInfo, err := priSn.Stat(ctx, "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedBaseFS := filepath.Join(secRoot, "snapshots", "1", "fs")
+	if got := baseInfo.Labels[upperdirKey]; got != expectedBaseFS {
+		t.Fatalf("expected %s label %q, got %q", upperdirKey, expectedBaseFS, got)
+	}
+
+	// 3. Verify View on single secondary layer uses bind mount from secRoot
+	viewMounts, err := priSn.View(ctx, "view-base", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if viewMounts[0].Source != expectedBaseFS {
+		t.Fatalf("expected bind source %q, got %q", expectedBaseFS, viewMounts[0].Source)
+	}
+	if err := priSn.Remove(ctx, "view-base"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Verify Prepare on top of secondary layers creates upperdir/workdir in primaryRoot
+	// while lowerdir references secRoot
+	activeMounts, err := priSn.Prepare(ctx, "active-container", "top")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedLower := fmt.Sprintf("lowerdir=%s:%s",
+		filepath.Join(secRoot, "snapshots", "2", "fs"),
+		filepath.Join(secRoot, "snapshots", "1", "fs"),
+	)
+	expectedUpper := fmt.Sprintf("upperdir=%s", filepath.Join(primaryRoot, "snapshots", "4", "fs"))
+	if activeMounts[0].Options[1] != expectedUpper {
+		t.Fatalf("expected upperdir option %q, got %q", expectedUpper, activeMounts[0].Options[1])
+	}
+	if activeMounts[0].Options[2] != expectedLower {
+		t.Fatalf("expected lowerdir option %q, got %q", expectedLower, activeMounts[0].Options[2])
+	}
+	if err := priSn.Remove(ctx, "active-container"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. Removing "top" removes its metadata from primaryRoot while leaving its backing directory on secRoot untouched
+	if err := priSn.Remove(ctx, "top"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := priSn.Stat(ctx, "top"); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected top snapshot to be removed from primary metadata, got err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(secRoot, "snapshots", "2")); err != nil {
+		t.Fatalf("expected secondary snapshot directory 2 to remain untouched on disk, stat err: %v", err)
+	}
+
+	// 6. Removing "base" when secondary root is read-only succeeds and leaves backing directory on disk
+	if os.Getuid() != 0 {
+		snapParent := filepath.Join(secRoot, "snapshots")
+		if err := os.Chmod(snapParent, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		if err := priSn.Remove(ctx, "base"); err != nil {
+			_ = os.Chmod(snapParent, 0o755)
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(snapParent, "1")); err != nil {
+			_ = os.Chmod(snapParent, 0o755)
+			t.Fatalf("expected read-only secondary snapshot directory 1 to remain on disk: %v", err)
+		}
+		if err := os.Chmod(snapParent, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Re-import "base" to test runtime disappearance below
+		for _, rec := range records {
+			if rec.Info.Name == "base" {
+				if err := importer.ImportCommittedSnapshot(ctx, rec.Info.Name, rec.Info, rec.Usage, secRoot, rec.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+
+	// 7. Create a primary committed child ("pri-top") and an active snapshot ("active-before-disappear") on top of secondary "base"
+	if _, err := priSn.Prepare(ctx, "prep-pri-top", "base"); err != nil {
+		t.Fatal(err)
+	}
+	if err := priSn.Commit(ctx, "pri-top", "prep-pri-top"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := priSn.Prepare(ctx, "active-before-disappear", "pri-top"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Disappearing secondary root causes Stat, Usage, Mounts, and Prepare to return ErrNotFound,
+	// including for "pri-top" whose own directory is on primaryRoot but whose ancestor "base" is on secRoot
+	if err := os.RemoveAll(secRoot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := priSn.Stat(ctx, "base"); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected Stat(base) to return ErrNotFound after secondary root disappeared, got: %v", err)
+	}
+	if _, err := priSn.Usage(ctx, "base"); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected Usage(base) to return ErrNotFound after secondary root disappeared, got: %v", err)
+	}
+	if _, err := priSn.Stat(ctx, "pri-top"); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected Stat(pri-top) to return ErrNotFound when ancestor in secondary root disappeared, got: %v", err)
+	}
+	if _, err := priSn.Mounts(ctx, "active-before-disappear"); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected Mounts(active-before-disappear) to return ErrNotFound after secondary root disappeared, got: %v", err)
+	}
+	if _, err := priSn.Prepare(ctx, "active-after-disappear", "pri-top"); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected Prepare(pri-top) to return ErrNotFound when ancestor in secondary root disappeared, got: %v", err)
 	}
 }

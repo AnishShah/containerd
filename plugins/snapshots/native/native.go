@@ -21,23 +21,53 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 
 	"github.com/containerd/continuity/fs"
 )
 
+// SnapshotterConfig is used to configure the native snapshotter instance.
+type SnapshotterConfig struct {
+	secondaryRoots []string
+}
+
+// Opt is an option to configure the native snapshotter.
+type Opt func(config *SnapshotterConfig) error
+
+// WithSecondaryRoots configures ordered secondary root directories for preloaded snapshots.
+func WithSecondaryRoots(roots []string) Opt {
+	return func(config *SnapshotterConfig) error {
+		for _, r := range roots {
+			if r != "" {
+				config.secondaryRoots = append(config.secondaryRoots, filepath.Clean(r))
+			}
+		}
+		return nil
+	}
+}
+
 type snapshotter struct {
-	root string
-	ms   *storage.MetaStore
+	root           string
+	secondaryRoots []string
+	ms             *storage.MetaStore
 }
 
 // NewSnapshotter returns a Snapshotter which copies layers on the underlying
 // file system. A metadata file is stored under the root.
-func NewSnapshotter(root string) (snapshots.Snapshotter, error) {
+func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
+	var config SnapshotterConfig
+	for _, opt := range opts {
+		if err := opt(&config); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
@@ -51,8 +81,9 @@ func NewSnapshotter(root string) (snapshots.Snapshotter, error) {
 	}
 
 	return &snapshotter{
-		root: root,
-		ms:   ms,
+		root:           root,
+		secondaryRoots: config.secondaryRoots,
+		ms:             ms,
 	}, nil
 }
 
@@ -64,7 +95,10 @@ func NewSnapshotter(root string) (snapshots.Snapshotter, error) {
 func (o *snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info, err error) {
 	err = o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		_, info, _, err = storage.GetInfo(ctx, key)
-		return err
+		if err != nil {
+			return err
+		}
+		return o.verifyStoragePaths(ctx, key)
 	})
 	if err != nil {
 		return snapshots.Info{}, err
@@ -75,6 +109,9 @@ func (o *snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info
 
 func (o *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (_ snapshots.Info, err error) {
 	err = o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		if err := o.verifyStoragePaths(ctx, info.Name); err != nil {
+			return err
+		}
 		info, err = storage.UpdateInfo(ctx, info, fieldpaths...)
 		return err
 	})
@@ -93,7 +130,10 @@ func (o *snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Us
 
 	err = o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		id, info, usage, err = storage.GetInfo(ctx, key)
-		return err
+		if err != nil {
+			return err
+		}
+		return o.verifyStoragePaths(ctx, key)
 	})
 	if err != nil {
 		return snapshots.Usage{}, err
@@ -130,7 +170,7 @@ func (o *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 			return fmt.Errorf("failed to get snapshot mount: %w", err)
 		}
 
-		return nil
+		return o.verifyStoragePaths(ctx, key)
 	})
 	if err != nil {
 		return nil, err
@@ -172,6 +212,10 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 			return fmt.Errorf("failed to remove: %w", err)
 		}
 
+		if isSecondaryStorageID(id) {
+			return nil
+		}
+
 		path = o.getSnapshotDir(id)
 		renamed = filepath.Join(o.root, "snapshots", "rm-"+id)
 		if err = os.Rename(path, renamed); err != nil {
@@ -206,6 +250,26 @@ func (o *snapshotter) Remove(ctx context.Context, key string) (err error) {
 
 // Walk the committed snapshots.
 func (o *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
+	return o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var statCache, keyCache map[string]error
+		if len(o.secondaryRoots) > 0 {
+			statCache = make(map[string]error)
+			keyCache = make(map[string]error)
+		}
+		return storage.WalkInfo(ctx, func(ctx context.Context, info snapshots.Info) error {
+			if err := o.verifyStoragePathsCached(ctx, info.Name, statCache, keyCache); err != nil {
+				if errdefs.IsNotFound(err) {
+					return nil
+				}
+				return err
+			}
+			return fn(ctx, info)
+		}, fs...)
+	})
+}
+
+// WalkAll walks all snapshots in the metastore without filtering out missing secondary storage paths.
+func (o *snapshotter) WalkAll(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
 	return o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		return storage.WalkInfo(ctx, fn, fs...)
 	})
@@ -242,6 +306,12 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	err = o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		if parent != "" {
+			if err := o.verifyStoragePaths(ctx, parent); err != nil {
+				return fmt.Errorf("failed to verify parent snapshot: %w", err)
+			}
+		}
+
 		s, err = storage.CreateSnapshot(ctx, kind, key, parent, opts...)
 		if err != nil {
 			return fmt.Errorf("failed to create snapshot: %w", err)
@@ -279,8 +349,123 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	return o.mounts(s), nil
 }
 
+func isSecondaryStorageID(id string) bool {
+	return filepath.IsAbs(id) || strings.ContainsRune(id, filepath.Separator)
+}
+
 func (o *snapshotter) getSnapshotDir(id string) string {
+	if isSecondaryStorageID(id) {
+		return id
+	}
 	return filepath.Join(o.root, "snapshots", id)
+}
+
+func (o *snapshotter) verifyStoragePaths(ctx context.Context, key string) error {
+	return o.verifyStoragePathsCached(ctx, key, nil, nil)
+}
+
+func (o *snapshotter) verifyStoragePathsCached(ctx context.Context, key string, statCache, keyCache map[string]error) error {
+	if len(o.secondaryRoots) == 0 {
+		return nil
+	}
+	return storage.WalkStoragePaths(ctx, key, keyCache, func(p string) error {
+		if !isSecondaryStorageID(p) {
+			return nil
+		}
+		var statErr error
+		if statCache != nil {
+			var cached bool
+			statErr, cached = statCache[p]
+			if !cached {
+				_, statErr = os.Stat(o.getSnapshotDir(p))
+				statCache[p] = statErr
+			}
+		} else {
+			_, statErr = os.Stat(o.getSnapshotDir(p))
+		}
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return fmt.Errorf("snapshot %s layer missing on secondary root: %w", key, errdefs.ErrNotFound)
+			}
+			return statErr
+		}
+		return nil
+	})
+}
+
+// SecondaryRoots returns the configured secondary root directories for this snapshotter.
+func (o *snapshotter) SecondaryRoots() []string {
+	return o.secondaryRoots
+}
+
+// SnapshotDirExists reports whether the snapshot directory for sourceID exists under sourceRoot.
+func (o *snapshotter) SnapshotDirExists(sourceRoot, sourceID string) bool {
+	_, err := os.Stat(filepath.Join(sourceRoot, "snapshots", sourceID))
+	return err == nil
+}
+
+// ImportCommittedSnapshot records a preloaded committed snapshot from a secondary root in the metastore.
+func (o *snapshotter) ImportCommittedSnapshot(ctx context.Context, key string, info snapshots.Info, usage snapshots.Usage, sourceRoot, sourceID string) error {
+	return o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		_, err := storage.PutCommittedSnapshot(ctx, key, info, usage, sourceRoot, sourceID)
+		return err
+	})
+}
+
+// ImportCommittedSnapshots records a batch of preloaded committed snapshots from a secondary root in a single metastore transaction.
+func (o *snapshotter) ImportCommittedSnapshots(ctx context.Context, imports []storage.CommittedSnapshotImport) error {
+	if len(imports) == 0 {
+		return nil
+	}
+	return o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		for _, imp := range imports {
+			if _, err := storage.PutCommittedSnapshot(ctx, imp.Key, imp.Info, imp.Usage, imp.SourceRoot, imp.SourceID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// RemoveMetadata removes a snapshot entry and any of its descendants from the metastore without deleting secondary backing directories.
+func (o *snapshotter) RemoveMetadata(ctx context.Context, key string) (err error) {
+	type renamedDir struct {
+		orig    string
+		renamed string
+	}
+	var renamedDirs []renamedDir
+	err = o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		removedIDs, err := storage.RemoveHierarchy(ctx, key)
+		if err != nil {
+			return err
+		}
+		for _, id := range removedIDs {
+			path := o.getSnapshotDir(id)
+			renamed := filepath.Join(o.root, "snapshots", "rm-"+id)
+			if err := os.Rename(path, renamed); err != nil {
+				if !os.IsNotExist(err) {
+					return fmt.Errorf("failed to rename: %w", err)
+				}
+				continue
+			}
+			renamedDirs = append(renamedDirs, renamedDir{orig: path, renamed: renamed})
+		}
+		return nil
+	})
+	if err != nil {
+		for _, d := range renamedDirs {
+			if err1 := os.Rename(d.renamed, d.orig); err1 != nil {
+				log.G(ctx).WithError(err1).WithField("path", d.renamed).Error("failed to rename after failed commit")
+			}
+		}
+		return err
+	}
+	for _, d := range renamedDirs {
+		if err := os.RemoveAll(d.renamed); err != nil {
+			log.G(ctx).WithError(err).WithField("path", d.renamed).Warnf("failed to remove root filesystem")
+		}
+	}
+	return nil
 }
 
 func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {

@@ -51,7 +51,9 @@ type Transactor interface {
 // active or view is based on. The ParentIDs are ordered from the highest to the
 // lowest base, meaning they should be applied in order from the last index to
 // the first index. The first index should always be considered the active
-// snapshot's immediate parent.
+// snapshot's immediate parent. For snapshots imported from a secondary root via
+// PutCommittedSnapshot or PutCommittedSnapshots, the identifier is the path to
+// the snapshot directory under that secondary root (<sourceRoot>/snapshots/<id>).
 type Snapshot struct {
 	Kind      snapshots.Kind
 	ID        string

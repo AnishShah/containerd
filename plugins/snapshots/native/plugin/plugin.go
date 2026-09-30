@@ -18,9 +18,11 @@ package plugin
 
 import (
 	"errors"
+	"path/filepath"
 
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/snapshots/native"
+	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
@@ -50,8 +52,17 @@ func init() {
 				root = config.RootPath
 			}
 
+			var opts []native.Opt
+			if srProp := ic.Properties[plugins.PropertySecondaryRootDirs]; srProp != "" {
+				if len(config.RootPath) == 0 {
+					opts = append(opts, native.WithSecondaryRoots(filepath.SplitList(srProp)))
+				} else {
+					log.G(ic.Context).WithField("root_path", config.RootPath).Warn("ignoring secondary_roots for native snapshotter because root_path is explicitly configured")
+				}
+			}
+
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root
-			return native.NewSnapshotter(root)
+			return native.NewSnapshotter(root, opts...)
 		},
 	})
 }

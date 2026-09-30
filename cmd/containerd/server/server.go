@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -164,14 +165,20 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
 		log.G(ctx).WithFields(log.Fields{"id": id, "type": p.Type}).Info("loading plugin")
 		var mustSucceed atomic.Int32
 
+		var secondaryRoots []string
+		for _, sr := range config.SecondaryRoots {
+			secondaryRoots = append(secondaryRoots, filepath.Join(filepath.Clean(sr), id))
+		}
+
 		initContext := plugin.NewContext(
 			ctx,
 			initialized,
 			map[string]string{
-				plugins.PropertyRootDir:      filepath.Join(config.Root, id),
-				plugins.PropertyStateDir:     filepath.Join(config.State, id),
-				plugins.PropertyGRPCAddress:  grpcAddress,
-				plugins.PropertyTTRPCAddress: ttrpcAddress,
+				plugins.PropertyRootDir:           filepath.Join(config.Root, id),
+				plugins.PropertySecondaryRootDirs: strings.Join(secondaryRoots, string(filepath.ListSeparator)),
+				plugins.PropertyStateDir:          filepath.Join(config.State, id),
+				plugins.PropertyGRPCAddress:       grpcAddress,
+				plugins.PropertyTTRPCAddress:      ttrpcAddress,
 			},
 		)
 		initContext.RegisterReadiness = func() func() {

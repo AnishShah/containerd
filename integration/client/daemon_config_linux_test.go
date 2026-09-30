@@ -18,6 +18,7 @@ package client
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -29,8 +30,11 @@ import (
 	"github.com/containerd/cgroups/v3"
 	"github.com/containerd/containerd/api/types/runc/options"
 	. "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/errdefs"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDaemonRuntimeRoot ensures plugin.linux.runtime_root is not ignored
@@ -173,4 +177,157 @@ version = 2
 			}
 		}
 	}
+}
+
+func TestDaemonSecondaryRoots(t *testing.T) {
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	preloadSecondaryRoot := func(t *testing.T, rootDir string) string {
+		t.Helper()
+		preloadConfig := fmt.Sprintf(`
+version = 4
+root = %q
+[plugins."io.containerd.cri.v1.runtime"]
+  stream_server_port = "0"
+`, rootDir)
+		preloadClient, _, preloadCleanup := newDaemonWithConfig(t, preloadConfig)
+		defer preloadCleanup()
+
+		img, err := preloadClient.Pull(ctx, testImage, WithPullUnpack)
+		require.NoError(t, err)
+		return filepath.Join(
+			rootDir,
+			"io.containerd.content.v1.content",
+			"blobs",
+			img.Target().Digest.Algorithm().String(),
+			img.Target().Digest.Encoded(),
+		)
+	}
+
+	runContainerFromImage := func(t *testing.T, client *Client, img Image, id string) {
+		t.Helper()
+		container, err := client.NewContainer(
+			ctx,
+			id,
+			WithNewSnapshot(id, img),
+			WithNewSpec(oci.WithImageConfig(img), withExitStatus(0)),
+		)
+		require.NoError(t, err)
+		defer container.Delete(ctx, WithSnapshotCleanup)
+
+		task, err := container.NewTask(ctx, empty())
+		require.NoError(t, err)
+		defer task.Delete(ctx)
+
+		statusC, err := task.Wait(ctx)
+		require.NoError(t, err)
+
+		require.NoError(t, task.Start(ctx))
+		status := <-statusC
+		code, _, err := status.Result()
+		require.NoError(t, err)
+		require.EqualValues(t, 0, code)
+	}
+
+	t.Run("WritableSecondaryRoot", func(t *testing.T) {
+		secRoot := t.TempDir()
+		primaryRoot := t.TempDir()
+
+		blobPath := preloadSecondaryRoot(t, secRoot)
+		_, err := os.Stat(blobPath)
+		require.NoError(t, err)
+
+		primaryConfig := fmt.Sprintf(`
+version = 4
+root = %q
+secondary_roots = [%q]
+[plugins."io.containerd.cri.v1.runtime"]
+  stream_server_port = "0"
+`, primaryRoot, secRoot)
+		client, _, cleanup := newDaemonWithConfig(t, primaryConfig)
+		defer cleanup()
+
+		// Image is imported from writable secondary root without pulling
+		img, err := client.GetImage(ctx, testImage)
+		require.NoError(t, err)
+		unpacked, err := img.IsUnpacked(ctx, "")
+		require.NoError(t, err)
+		require.True(t, unpacked)
+
+		// Container runs using lowerdirs from secondary root and upperdir/workdir on primary root
+		runContainerFromImage(t, client, img, "ctr-writable-secroot")
+
+		// Deleting the image removes it from primary DB and records tombstones while leaving secondary root files untouched
+		require.NoError(t, client.ImageService().Delete(ctx, testImage, images.SynchronousDelete()))
+		_, err = client.GetImage(ctx, testImage)
+		require.True(t, errdefs.IsNotFound(err))
+
+		_, err = os.Stat(blobPath)
+		require.NoError(t, err, "expected backing blob on secondary root to remain untouched on disk")
+
+		entries, err := os.ReadDir(filepath.Join(secRoot, "io.containerd.snapshotter.v1.overlayfs", "snapshots"))
+		require.NoError(t, err)
+		require.NotEmpty(t, entries, "expected backing snapshots on secondary root to remain untouched on disk")
+	})
+
+	t.Run("ReadOnlySecondaryRoot", func(t *testing.T) {
+		secBackingRoot := t.TempDir()
+		secROMount := t.TempDir()
+		primaryRoot := t.TempDir()
+
+		_ = preloadSecondaryRoot(t, secBackingRoot)
+
+		// Bind-mount secBackingRoot onto secROMount as a read-only filesystem
+		require.NoError(t, syscall.Mount(secBackingRoot, secROMount, "none", syscall.MS_BIND|syscall.MS_REC, ""))
+		t.Cleanup(func() {
+			_ = syscall.Unmount(secROMount, syscall.MNT_DETACH)
+		})
+		require.NoError(t, syscall.Mount("none", secROMount, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY, ""))
+
+		primaryConfig := fmt.Sprintf(`
+version = 4
+root = %q
+secondary_roots = [%q]
+[plugins."io.containerd.cri.v1.runtime"]
+  stream_server_port = "0"
+`, primaryRoot, secROMount)
+		client, _, cleanup := newDaemonWithConfig(t, primaryConfig)
+
+		// Image is imported from read-only secondary root
+		img, err := client.GetImage(ctx, testImage)
+		require.NoError(t, err)
+		unpacked, err := img.IsUnpacked(ctx, "")
+		require.NoError(t, err)
+		require.True(t, unpacked)
+
+		roBlobPath := filepath.Join(
+			secROMount,
+			"io.containerd.content.v1.content",
+			"blobs",
+			img.Target().Digest.Algorithm().String(),
+			img.Target().Digest.Encoded(),
+		)
+
+		// Container runs using read-only secondary root layers
+		runContainerFromImage(t, client, img, "ctr-readonly-secroot")
+
+		// Deleting the image succeeds (EROFS ignored) and records tombstones in primary root
+		require.NoError(t, client.ImageService().Delete(ctx, testImage, images.SynchronousDelete()))
+		_, err = client.GetImage(ctx, testImage)
+		require.True(t, errdefs.IsNotFound(err))
+
+		// Backing files remain on the read-only secondary root
+		_, err = os.Stat(roBlobPath)
+		require.NoError(t, err, "expected backing blob on read-only secondary root to remain on disk")
+
+		cleanup()
+
+		// Restarting daemon against the same primaryRoot and read-only secondary root must not resurrect the deleted image
+		client2, _, cleanup2 := newDaemonWithConfig(t, primaryConfig)
+		defer cleanup2()
+
+		_, err = client2.GetImage(ctx, testImage)
+		require.True(t, errdefs.IsNotFound(err), "tombstoned image from read-only secondary root must not be re-imported after restart")
+	})
 }

@@ -46,6 +46,7 @@ func TestMergeConfigs(t *testing.T) {
 	a := &Config{
 		Version:          2,
 		Root:             "old_root",
+		SecondaryRoots:   []string{"/secondary/one"},
 		RequiredPlugins:  []string{"io.containerd.old_plugin.v1"},
 		DisabledPlugins:  []string{"io.containerd.old_plugin.v1"},
 		State:            "old_state",
@@ -57,6 +58,7 @@ func TestMergeConfigs(t *testing.T) {
 	b := &Config{
 		Version:          2,
 		Root:             "new_root",
+		SecondaryRoots:   []string{"/secondary/one", "/secondary/two"},
 		RequiredPlugins:  []string{"io.containerd.new_plugin1.v1", "io.containerd.new_plugin2.v1"},
 		DisabledPlugins:  []string{"io.containerd.old_plugin.v1"},
 		OOMScore:         2,
@@ -69,6 +71,7 @@ func TestMergeConfigs(t *testing.T) {
 
 	assert.Equal(t, 2, a.Version)
 	assert.Equal(t, "new_root", a.Root)
+	assert.Equal(t, []string{"/secondary/one", "/secondary/two"}, a.SecondaryRoots)
 	assert.Equal(t, "old_state", a.State)
 	assert.Equal(t, 2, a.OOMScore)
 	assert.Equal(t, []string{"io.containerd.old_plugin.v1", "io.containerd.new_plugin1.v1", "io.containerd.new_plugin2.v1"}, a.RequiredPlugins)
@@ -129,6 +132,10 @@ func TestLoadSingleConfig(t *testing.T) {
 	data := `
 version = 2
 root = "/var/lib/containerd"
+secondary_roots = [
+  "/var/lib/containerd-preload",
+  "/mnt/readonly-image-cache-disk"
+]
 
 [stream_processors]
   [stream_processors."io.containerd.processor.v1.pigz"]
@@ -146,6 +153,10 @@ root = "/var/lib/containerd"
 	assert.NoError(t, err)
 	assert.Equal(t, 2, out.Version)
 	assert.Equal(t, "/var/lib/containerd", out.Root)
+	assert.Equal(t, []string{
+		"/var/lib/containerd-preload",
+		"/mnt/readonly-image-cache-disk",
+	}, out.SecondaryRoots)
 	assert.Equal(t, map[string]StreamProcessor{
 		"io.containerd.processor.v1.pigz": {
 			Accepts: []string{"application/vnd.docker.image.rootfs.diff.tar.gzip"},

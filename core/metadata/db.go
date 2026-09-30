@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,10 +71,23 @@ func WithEventsPublisher(p events.Publisher) DBOpt {
 	}
 }
 
+// WithSecondaryRoots configures ordered secondary root directories for importing
+// preloaded images, content blobs, and snapshots.
+func WithSecondaryRoots(roots []string) DBOpt {
+	return func(o *dbOptions) {
+		for _, r := range roots {
+			if r != "" {
+				o.secondaryRoots = append(o.secondaryRoots, filepath.Clean(r))
+			}
+		}
+	}
+}
+
 // dbOptions configure db options.
 type dbOptions struct {
-	shared    bool
-	publisher events.Publisher
+	shared         bool
+	publisher      events.Publisher
+	secondaryRoots []string
 }
 
 // DB represents a metadata database backed by a bolt
@@ -112,7 +126,8 @@ type DB struct {
 	// collectible resources
 	collectors map[gc.ResourceType]Collector
 
-	dbopts dbOptions
+	deletedDigestsMu sync.Mutex
+	dbopts           dbOptions
 }
 
 // NewDB creates a new metadata database using the provided
@@ -232,7 +247,10 @@ func (m *DB) Init(ctx context.Context) error {
 	if err == errSkip {
 		err = nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return m.syncSecondaryRoots(ctx)
 }
 
 // ContentStore returns a namespaced content store

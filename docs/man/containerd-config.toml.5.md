@@ -32,6 +32,9 @@ Older configs are automatically migrated on startup.
 **root**
 : The root directory for containerd metadata. (Default: "/var/lib/containerd")
 
+**secondary_roots**
+: An optional ordered list of distinct, read-only secondary root directories containing preloaded containerd metadata (`io.containerd.metadata.v1.bolt/meta.db`), content blobs (`io.containerd.content.v1.content`), and committed snapshots for supported snapshotters (`overlayfs` and `native`). Entries must be distinct from `root`, `state`, and each other, must not contain `,` or the OS path list separator (e.g., `:` on Unix), and must reside on a filesystem that supports `mmap` and `flock` for BoltDB. Lookup precedence is `root` followed by `secondary_roots` in list order, while all new writes, ingests, and active snapshots are created in `root`. Secondary root directories must not be modified while attached and are never modified by containerd; if a secondary root is removed from `secondary_roots` or becomes unavailable, its non-promoted metadata entries are automatically pruned and missing resources fall back to `root`.
+
 **state**
 : The state directory for containerd (Default: "/run/containerd")
 

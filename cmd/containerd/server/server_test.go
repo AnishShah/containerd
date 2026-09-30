@@ -20,16 +20,19 @@ import (
 	"context"
 	"iter"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"testing"
 
 	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/version"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const testPath = "/tmp/path/for/testing"
@@ -194,4 +197,38 @@ func TestSetTempDirEnv(t *testing.T) {
 			t.Errorf("expected %s=%q, got %q", k, tempDir, got)
 		}
 	}
+}
+
+func TestSecondaryRootsPluginProperty(t *testing.T) {
+	registry.Reset()
+	defer registry.Reset()
+
+	var gotSecondaryRoots string
+	registry.Register(&plugin.Registration{
+		Type: "io.containerd.test",
+		ID:   "secroots",
+		InitFn: func(ic *plugin.InitContext) (any, error) {
+			gotSecondaryRoots = ic.Properties[plugins.PropertySecondaryRootDirs]
+			return nil, nil
+		},
+	})
+
+	primaryRoot := filepath.Join(t.TempDir(), "primary")
+	sec1 := filepath.Join(t.TempDir(), "sec1")
+	sec2 := filepath.Join(t.TempDir(), "sec2")
+
+	cfg := &srvconfig.Config{
+		Version:        version.ConfigVersion,
+		Root:           primaryRoot,
+		State:          filepath.Join(t.TempDir(), "state"),
+		SecondaryRoots: []string{sec1, sec2},
+	}
+
+	_, err := New(t.Context(), cfg)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{
+		filepath.Join(sec1, "io.containerd.test.secroots"),
+		filepath.Join(sec2, "io.containerd.test.secroots"),
+	}, filepath.SplitList(gotSecondaryRoots))
 }

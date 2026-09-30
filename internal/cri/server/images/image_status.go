@@ -44,8 +44,6 @@ func (c *CRIImageService) ImageStatus(ctx context.Context, r *runtime.ImageStatu
 		}
 		return nil, fmt.Errorf("can not resolve %q locally: %w", r.GetImage().GetImage(), err)
 	}
-	// TODO(random-liu): [P0] Make sure corresponding snapshot exists. What if snapshot
-	// doesn't exist?
 
 	runtimeImage := toCRIImage(image)
 	info, err := c.toCRIImageInfo(ctx, &image, r.GetVerbose())

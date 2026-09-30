@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -59,6 +60,13 @@ func MetaStoreSuite(t *testing.T, name string, meta func(root string) (*MetaStor
 	t.Run("RemoveWithChildren", makeTest(t, name, meta, inWriteTransaction(testRemoveWithChildren)))
 	t.Run("ParentIDs", makeTest(t, name, meta, inWriteTransaction(testParents)))
 	t.Run("Rebase", makeTest(t, name, meta, inWriteTransaction(testRebase)))
+	t.Run("PutCommittedSnapshot", makeTest(t, name, meta, inWriteTransaction(testPutCommittedSnapshot)))
+	t.Run("GetStoragePathsAndMixedChain", makeTest(t, name, meta, inWriteTransaction(testGetStoragePathsAndMixedChain)))
+	t.Run("RemoveHierarchy", makeTest(t, name, meta, inWriteTransaction(testRemoveHierarchy)))
+	t.Run("IDMap", makeTest(t, name, meta, inWriteTransaction(testIDMap)))
+	t.Run("ReadSecondarySnapshots", func(t *testing.T) {
+		testReadSecondarySnapshots(t, meta)
+	})
 }
 
 // makeTest creates a testsuite with a writable transaction
@@ -700,5 +708,289 @@ func testRebase(ctx context.Context, t *testing.T, ms *MetaStore) {
 		if err == nil {
 			t.Fatalf("Expected removal of parent %s to fail", tc.Name)
 		}
+	}
+}
+
+func testPutCommittedSnapshot(ctx context.Context, t *testing.T, ms *MetaStore) {
+	secRoot1 := "/sec/root1"
+	secRoot2 := "/sec/root2"
+
+	// 1. Import root committed snapshot
+	sid1, err := PutCommittedSnapshot(ctx, "sec-base", snapshots.Info{
+		Name:   "sec-base",
+		Labels: map[string]string{"k": "v"},
+	}, snapshots.Usage{Inodes: 10, Size: 100}, secRoot1, "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSID1 := filepath.Join(secRoot1, "snapshots", "1")
+	if sid1 != expectedSID1 {
+		t.Fatalf("expected storage ID %q, got %q", expectedSID1, sid1)
+	}
+
+	gotID, gotInfo, gotUsage, err := GetInfo(ctx, "sec-base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotID != expectedSID1 || gotInfo.Kind != snapshots.KindCommitted || gotUsage.Size != 100 || gotInfo.Labels["k"] != "v" {
+		t.Fatalf("unexpected GetInfo result: id=%q info=%+v usage=%+v", gotID, gotInfo, gotUsage)
+	}
+
+	// 2. Import child committed snapshot
+	sid2, err := PutCommittedSnapshot(ctx, "sec-child", snapshots.Info{
+		Name:   "sec-child",
+		Parent: "sec-base",
+	}, snapshots.Usage{Inodes: 20, Size: 200}, secRoot1, "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSID2 := filepath.Join(secRoot1, "snapshots", "2")
+	if sid2 != expectedSID2 {
+		t.Fatalf("expected storage ID %q, got %q", expectedSID2, sid2)
+	}
+
+	// 3. Error cases: non-existent parent and non-committed parent
+	if _, err := PutCommittedSnapshot(ctx, "bad-missing-parent", snapshots.Info{
+		Name:   "bad-missing-parent",
+		Parent: "does-not-exist",
+	}, snapshots.Usage{}, secRoot1, "3"); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected ErrNotFound for missing parent, got: %v", err)
+	}
+
+	if _, err := CreateSnapshot(ctx, snapshots.KindActive, "active-snap", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PutCommittedSnapshot(ctx, "bad-active-parent", snapshots.Info{
+		Name:   "bad-active-parent",
+		Parent: "active-snap",
+	}, snapshots.Usage{}, secRoot1, "4"); !errdefs.IsInvalidArgument(err) {
+		t.Fatalf("expected ErrInvalidArgument for active parent, got: %v", err)
+	}
+
+	if _, err := CreateSnapshot(ctx, snapshots.KindView, "view-snap", "sec-base"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PutCommittedSnapshot(ctx, "bad-view-parent", snapshots.Info{
+		Name:   "bad-view-parent",
+		Parent: "view-snap",
+	}, snapshots.Usage{}, secRoot1, "5"); !errdefs.IsInvalidArgument(err) {
+		t.Fatalf("expected ErrInvalidArgument for view parent, got: %v", err)
+	}
+	if _, _, err := Remove(ctx, "view-snap"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Update existing snapshot via PutCommittedSnapshot when Parent changes
+	if _, err := PutCommittedSnapshot(ctx, "sec-base2", snapshots.Info{
+		Name: "sec-base2",
+	}, snapshots.Usage{}, secRoot2, "10"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PutCommittedSnapshot(ctx, "sec-child", snapshots.Info{
+		Name:   "sec-child",
+		Parent: "sec-base2",
+	}, snapshots.Usage{Inodes: 30, Size: 300}, secRoot2, "20"); err != nil {
+		t.Fatal(err)
+	}
+	// Old parent ("sec-base") should now have no children and be removable
+	if _, _, err := Remove(ctx, "sec-base"); err != nil {
+		t.Fatalf("expected old parent sec-base to be removable after child parent update, got: %v", err)
+	}
+	// New parent ("sec-base2") should have a child link and fail removal
+	if _, _, err := Remove(ctx, "sec-base2"); !errdefs.IsFailedPrecondition(err) {
+		t.Fatalf("expected new parent sec-base2 removal to fail with ErrFailedPrecondition, got: %v", err)
+	}
+}
+
+func testGetStoragePathsAndMixedChain(ctx context.Context, t *testing.T, ms *MetaStore) {
+	if err := WalkStoragePaths(ctx, "nonexistent", nil, func(string) error { return nil }); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected ErrNotFound for nonexistent key, got: %v", err)
+	}
+
+	secRoot := "/sec/root"
+	if _, err := PutCommittedSnapshot(ctx, "layer1", snapshots.Info{Name: "layer1"}, snapshots.Usage{}, secRoot, "10"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PutCommittedSnapshot(ctx, "layer2", snapshots.Info{Name: "layer2", Parent: "layer1"}, snapshots.Usage{}, secRoot, "20"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit a primary-root layer on top of secondary layer2
+	if _, err := CreateSnapshot(ctx, snapshots.KindActive, "prep-layer3", "layer2"); err != nil {
+		t.Fatal(err)
+	}
+	layer3ID, err := CommitActive(ctx, "prep-layer3", "layer3", snapshots.Usage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create an active snapshot on top of primary layer3
+	activeSnap, err := CreateSnapshot(ctx, snapshots.KindActive, "active-top", "layer3")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedParents := []string{
+		layer3ID,
+		filepath.Join(secRoot, "snapshots", "20"),
+		filepath.Join(secRoot, "snapshots", "10"),
+	}
+	if diff := cmp.Diff(expectedParents, activeSnap.ParentIDs); diff != "" {
+		t.Fatalf("unexpected ParentIDs (-want +got):\n%s", diff)
+	}
+
+	gotSnap, err := GetSnapshot(ctx, "active-top")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(expectedParents, gotSnap.ParentIDs); diff != "" {
+		t.Fatalf("unexpected GetSnapshot ParentIDs (-want +got):\n%s", diff)
+	}
+
+	var paths []string
+	visited := map[string]error{}
+	if err := WalkStoragePaths(ctx, "active-top", visited, func(storageID string) error {
+		paths = append(paths, storageID)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	expectedPaths := append([]string{activeSnap.ID}, expectedParents...)
+	if diff := cmp.Diff(expectedPaths, paths); diff != "" {
+		t.Fatalf("unexpected WalkStoragePaths (-want +got):\n%s", diff)
+	}
+}
+
+func testRemoveHierarchy(ctx context.Context, t *testing.T, ms *MetaStore) {
+	// Removing non-existent key returns nil
+	if removed, err := RemoveHierarchy(ctx, "does-not-exist"); err != nil || len(removed) != 0 {
+		t.Fatalf("expected nil for non-existent key, got removed=%v, err=%v", removed, err)
+	}
+
+	secRoot := "/sec/root"
+	if _, err := PutCommittedSnapshot(ctx, "anc", snapshots.Info{Name: "anc"}, snapshots.Usage{}, secRoot, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PutCommittedSnapshot(ctx, "root", snapshots.Info{Name: "root", Parent: "anc"}, snapshots.Usage{}, secRoot, "2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PutCommittedSnapshot(ctx, "child", snapshots.Info{Name: "child", Parent: "root"}, snapshots.Usage{}, secRoot, "3"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PutCommittedSnapshot(ctx, "grandchild", snapshots.Info{Name: "grandchild", Parent: "child"}, snapshots.Usage{}, secRoot, "4"); err != nil {
+		t.Fatal(err)
+	}
+	priChild, err := CreateSnapshot(ctx, snapshots.KindActive, "pri-child", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	removedIDs, err := RemoveHierarchy(ctx, "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff([]string{priChild.ID}, removedIDs); diff != "" {
+		t.Fatalf("unexpected removed primary IDs (-want +got):\n%s", diff)
+	}
+
+	for _, k := range []string{"root", "child", "grandchild", "pri-child"} {
+		if _, _, _, err := GetInfo(ctx, k); !errdefs.IsNotFound(err) {
+			t.Fatalf("expected %q to be removed by RemoveHierarchy, got err: %v", k, err)
+		}
+	}
+
+	// Verify parent link from "anc" to "root" was cleaned up so "anc" can be removed via Remove
+	if _, _, err := Remove(ctx, "anc"); err != nil {
+		t.Fatalf("expected ancestor 'anc' to be removable after RemoveHierarchy('root'), got: %v", err)
+	}
+}
+
+func testIDMap(ctx context.Context, t *testing.T, ms *MetaStore) {
+	if _, err := PutCommittedSnapshot(ctx, "sec-snap", snapshots.Info{Name: "sec-snap"}, snapshots.Usage{}, "/sec/root", "1"); err != nil {
+		t.Fatal(err)
+	}
+	priSnap, err := CreateSnapshot(ctx, snapshots.KindActive, "pri-active", "sec-snap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	priCommittedID, err := CommitActive(ctx, "pri-active", "pri-committed", snapshots.Usage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	idMap, err := IDMap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string]string{
+		priCommittedID: "pri-committed",
+	}
+	if diff := cmp.Diff(expected, idMap); diff != "" {
+		t.Fatalf("unexpected IDMap (-want +got):\n%s (priSnap.ID=%s)", diff, priSnap.ID)
+	}
+}
+
+func testReadSecondarySnapshots(t *testing.T, metaFn metaFactory) {
+	ctx := context.Background()
+
+	// 1. Non-existent file path returns error
+	if _, err := ReadSecondarySnapshots(filepath.Join(t.TempDir(), "nonexistent.db")); err == nil {
+		t.Fatal("expected error when reading nonexistent db file")
+	}
+
+	// 2. Empty database (no v1/snapshots bucket yet)
+	emptyDir := t.TempDir()
+	emptyMS, err := metaFn(emptyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := emptyMS.WithTransaction(ctx, true, func(ctx context.Context) error {
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := emptyMS.Close(); err != nil {
+		t.Fatal(err)
+	}
+	emptyRecords, err := ReadSecondarySnapshots(filepath.Join(emptyDir, "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(emptyRecords) != 0 {
+		t.Fatalf("expected 0 records from empty db, got %d", len(emptyRecords))
+	}
+
+	// 3. Populated database with KindCommitted, KindActive, and KindView
+	popDir := t.TempDir()
+	popMS, err := metaFn(popDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txCtx, tx, err := popMS.TransactionContext(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := basePopulate(txCtx, popMS); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := popMS.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := ReadSecondarySnapshots(filepath.Join(popDir, "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// basePopulate creates committed-1 and committed-2, plus active-* and view-*
+	assert.Len(t, records, 2)
+	assert.Contains(t, records, "committed-1")
+	assert.Contains(t, records, "committed-2")
+	for k, rec := range records {
+		assert.Equal(t, snapshots.KindCommitted, rec.Info.Kind, "record %s must be KindCommitted", k)
+		assert.NotEmpty(t, rec.ID)
 	}
 }

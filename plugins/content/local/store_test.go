@@ -440,3 +440,173 @@ func TestWriteReadEmptyFileTimestamp(t *testing.T) {
 		t.Errorf("read empty timestamp file should return time.Time{}, but got: %v", timestamp)
 	}
 }
+
+func TestSecondaryRoots(t *testing.T) {
+	ctx := t.Context()
+	primaryDir := t.TempDir()
+	sec1Dir := t.TempDir()
+	sec2Dir := t.TempDir()
+
+	sec1Store, err := NewStore(sec1Dir)
+	assert.NoError(t, err)
+	sec2Store, err := NewStore(sec2Dir)
+	assert.NoError(t, err)
+
+	blob1 := []byte("blob-in-sec1")
+	dgst1 := digest.FromBytes(blob1)
+	checkWrite(ctx, t, sec1Store, dgst1, blob1)
+
+	blob2 := []byte("blob-in-sec2")
+	dgst2 := digest.FromBytes(blob2)
+	checkWrite(ctx, t, sec2Store, dgst2, blob2)
+
+	blobBoth := []byte("blob-in-both-sec1-and-sec2")
+	dgstBoth := digest.FromBytes(blobBoth)
+	checkWrite(ctx, t, sec1Store, dgstBoth, blobBoth)
+	checkWrite(ctx, t, sec2Store, dgstBoth, blobBoth)
+
+	cs, err := NewLabeledStoreWithSecondaryRoots(primaryDir, []string{sec1Dir, sec2Dir}, newMemoryLabelStore())
+	assert.NoError(t, err)
+
+	// Verify blobs from secondary roots are accessible via Info and ReaderAt
+	info1, err := cs.Info(ctx, dgst1)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(len(blob1)), info1.Size)
+
+	ra1, err := cs.ReaderAt(ctx, ocispec.Descriptor{Digest: dgst1, Size: int64(len(blob1))})
+	assert.NoError(t, err)
+	buf := make([]byte, len(blob1))
+	_, err = ra1.ReadAt(buf, 0)
+	assert.NoError(t, err)
+	assert.Equal(t, blob1, buf)
+	assert.NoError(t, ra1.Close())
+
+	// Verify Walk deduplicates across roots and finds all blobs
+	walked := map[digest.Digest]int{}
+	err = cs.Walk(ctx, func(bi content.Info) error {
+		walked[bi.Digest]++
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, map[digest.Digest]int{
+		dgst1:    1,
+		dgst2:    1,
+		dgstBoth: 1,
+	}, walked)
+
+	// Writing a new blob goes to primaryDir, not secondary roots
+	blobPrimary := []byte("blob-in-primary")
+	dgstPrimary := digest.FromBytes(blobPrimary)
+	checkWrite(ctx, t, cs, dgstPrimary, blobPrimary)
+	_, err = os.Stat(filepath.Join(primaryDir, "blobs", dgstPrimary.Algorithm().String(), dgstPrimary.Encoded()))
+	assert.NoError(t, err)
+	_, err = os.Stat(filepath.Join(sec1Dir, "blobs", dgstPrimary.Algorithm().String(), dgstPrimary.Encoded()))
+	assert.True(t, os.IsNotExist(err))
+
+	// Writer with expected digest present in secondary root returns ErrAlreadyExists
+	_, err = cs.Writer(ctx, content.WithRef("ref-exists"), content.WithDescriptor(ocispec.Descriptor{Digest: dgst1, Size: int64(len(blob1))}))
+	assert.True(t, errdefs.IsAlreadyExists(err))
+
+	// Deleting a blob on a secondary root marks it deleted in the store while leaving the secondary root file untouched
+	err = cs.Delete(ctx, dgst1)
+	assert.NoError(t, err)
+	_, err = cs.Info(ctx, dgst1)
+	assert.True(t, errdefs.IsNotFound(err))
+	_, err = os.Stat(filepath.Join(sec1Dir, "blobs", dgst1.Algorithm().String(), dgst1.Encoded()))
+	assert.NoError(t, err)
+
+	// Once tombstoned, Writer with expected digest dgst1 succeeds and writes to primaryDir
+	checkWrite(ctx, t, cs, dgst1, blob1)
+	_, err = os.Stat(filepath.Join(primaryDir, "blobs", dgst1.Algorithm().String(), dgst1.Encoded()))
+	assert.NoError(t, err)
+
+	// Deleting a duplicate blob present in both sec1Dir and sec2Dir hides it across all secondary roots
+	err = cs.Delete(ctx, dgstBoth)
+	assert.NoError(t, err)
+	_, err = cs.Info(ctx, dgstBoth)
+	assert.True(t, errdefs.IsNotFound(err))
+	_, err = cs.ReaderAt(ctx, ocispec.Descriptor{Digest: dgstBoth, Size: int64(len(blobBoth))})
+	assert.True(t, errdefs.IsNotFound(err))
+	walkedAfterDelete := map[digest.Digest]int{}
+	err = cs.Walk(ctx, func(bi content.Info) error {
+		walkedAfterDelete[bi.Digest]++
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.NotContains(t, walkedAfterDelete, dgstBoth)
+
+	// SetDeletedDigests hides secondary-root blobs (e.g. dgst2, dgstBoth) while still serving blobs present in primaryDir (e.g. dgst1, dgstPrimary)
+	cs.(*store).SetDeletedDigests([]digest.Digest{dgst1, dgst2, dgstBoth})
+	_, err = cs.Info(ctx, dgst2)
+	assert.True(t, errdefs.IsNotFound(err))
+	_, err = cs.ReaderAt(ctx, ocispec.Descriptor{Digest: dgst2, Size: int64(len(blob2))})
+	assert.True(t, errdefs.IsNotFound(err))
+	_, err = cs.Info(ctx, dgst1)
+	assert.NoError(t, err, "dgst1 is in primaryDir so SetDeletedDigests must not hide it")
+	walkedAfterSet := map[digest.Digest]int{}
+	err = cs.Walk(ctx, func(bi content.Info) error {
+		walkedAfterSet[bi.Digest]++
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.NotContains(t, walkedAfterSet, dgst2)
+	assert.NotContains(t, walkedAfterSet, dgstBoth)
+	assert.Contains(t, walkedAfterSet, dgst1)
+	assert.Contains(t, walkedAfterSet, dgstPrimary)
+
+	// Clear deleted digests so dgst2 is visible again from sec2Dir
+	cs.(*store).SetDeletedDigests(nil)
+	_, err = cs.Info(ctx, dgst2)
+	assert.NoError(t, err)
+
+	// Simulate read-only secondary root on non-Windows/non-root
+	if runtime.GOOS != "windows" && os.Getuid() != 0 {
+		algDir := filepath.Join(sec2Dir, "blobs", dgst2.Algorithm().String())
+		assert.NoError(t, os.Chmod(algDir, 0o555))
+		defer os.Chmod(algDir, 0o755)
+
+		// Update on a secondary-root blob succeeds without mutating the read-only secondary root file
+		updatedInfo, err := cs.Update(ctx, content.Info{
+			Digest: dgst2,
+			Labels: map[string]string{"test-label": "val"},
+		}, "labels.test-label")
+		assert.NoError(t, err)
+		assert.Equal(t, "val", updatedInfo.Labels["test-label"])
+
+		err = cs.Delete(ctx, dgst2)
+		assert.NoError(t, err)
+
+		// Backing file still exists on read-only disk, and store treats it as deleted
+		_, err = os.Stat(filepath.Join(algDir, dgst2.Encoded()))
+		assert.NoError(t, err)
+		_, err = cs.Info(ctx, dgst2)
+		assert.True(t, errdefs.IsNotFound(err))
+
+		// Re-writing the deleted blob writes it to primaryDir and clears deleted marker
+		checkWrite(ctx, t, cs, dgst2, blob2)
+		_, err = cs.Info(ctx, dgst2)
+		assert.NoError(t, err)
+	}
+
+	// Simulate secondary root disappearing at runtime
+	blobDisappear := []byte("blob-in-disappearing-sec")
+	dgstDisappear := digest.FromBytes(blobDisappear)
+	sec3Dir := t.TempDir()
+	sec3Store, err := NewStore(sec3Dir)
+	assert.NoError(t, err)
+	checkWrite(ctx, t, sec3Store, dgstDisappear, blobDisappear)
+
+	cs3, err := NewStoreWithSecondaryRoots(primaryDir, []string{sec3Dir})
+	assert.NoError(t, err)
+	_, err = cs3.Info(ctx, dgstDisappear)
+	assert.NoError(t, err)
+
+	assert.NoError(t, os.RemoveAll(sec3Dir))
+	_, err = cs3.Info(ctx, dgstDisappear)
+	assert.True(t, errdefs.IsNotFound(err))
+
+	// Can now write the disappeared blob to primaryDir
+	checkWrite(ctx, t, cs3, dgstDisappear, blobDisappear)
+	_, err = cs3.Info(ctx, dgstDisappear)
+	assert.NoError(t, err)
+}

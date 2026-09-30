@@ -67,8 +67,12 @@ type LabelStore interface {
 // including resumable ingest.
 type store struct {
 	root               string
+	secondaryRoots     []string
 	ls                 LabelStore
 	integritySupported bool
+
+	deletedMu       sync.RWMutex
+	deletedReadOnly map[digest.Digest]struct{}
 
 	locksMu              sync.Mutex
 	locks                map[string]*lock
@@ -80,12 +84,23 @@ func NewStore(root string) (content.Store, error) {
 	return NewLabeledStore(root, nil)
 }
 
+// NewStoreWithSecondaryRoots returns a local content store with ordered secondary roots
+func NewStoreWithSecondaryRoots(root string, secondaryRoots []string) (content.Store, error) {
+	return NewLabeledStoreWithSecondaryRoots(root, secondaryRoots, nil)
+}
+
 // NewLabeledStore returns a new content store using the provided label store
 //
 // Note: content stores which are used underneath a metadata store may not
 // require labels and should use `NewStore`. `NewLabeledStore` is primarily
 // useful for tests or standalone implementations.
 func NewLabeledStore(root string, ls LabelStore) (content.Store, error) {
+	return NewLabeledStoreWithSecondaryRoots(root, nil, ls)
+}
+
+// NewLabeledStoreWithSecondaryRoots returns a new content store using the provided
+// primary root, ordered secondary roots, and label store.
+func NewLabeledStoreWithSecondaryRoots(root string, secondaryRoots []string, ls LabelStore) (content.Store, error) {
 	if _, err := os.Stat(root); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("failed to stat %q: %w", root, err)
@@ -98,28 +113,155 @@ func NewLabeledStore(root string, ls LabelStore) (content.Store, error) {
 	if err != nil {
 		log.L.WithError(err).WithField("path", root).Warnf("failed check for fsverity support")
 	}
+	var cleanedSecondary []string
+	for _, sr := range secondaryRoots {
+		if sr != "" {
+			cleanedSecondary = append(cleanedSecondary, filepath.Clean(sr))
+		}
+	}
 	s := &store{
 		root:               root,
+		secondaryRoots:     cleanedSecondary,
 		ls:                 ls,
 		integritySupported: supported,
+		deletedReadOnly:    map[digest.Digest]struct{}{},
 		locks:              map[string]*lock{},
 	}
 	s.ensureIngestRootOnce = sync.OnceValue(s.ensureIngestRoot)
 	return s, nil
 }
 
-func (s *store) Info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
+// SetDeletedDigests sets the set of digests that have been tombstoned on read-only secondary roots.
+func (s *store) SetDeletedDigests(digests []digest.Digest) {
+	s.deletedMu.Lock()
+	defer s.deletedMu.Unlock()
+	s.deletedReadOnly = make(map[digest.Digest]struct{}, len(digests))
+	for _, d := range digests {
+		s.deletedReadOnly[d] = struct{}{}
+	}
+}
+
+func (s *store) isDeletedReadOnly(dgst digest.Digest) bool {
+	s.deletedMu.RLock()
+	defer s.deletedMu.RUnlock()
+	_, ok := s.deletedReadOnly[dgst]
+	return ok
+}
+
+func (s *store) markDeletedReadOnly(dgst digest.Digest) {
+	s.deletedMu.Lock()
+	defer s.deletedMu.Unlock()
+	s.deletedReadOnly[dgst] = struct{}{}
+}
+
+func (s *store) unmarkDeletedReadOnly(dgst digest.Digest) {
+	s.deletedMu.Lock()
+	defer s.deletedMu.Unlock()
+	delete(s.deletedReadOnly, dgst)
+}
+
+// HasBlobInSecondaryRoot reports whether the secondary root at index contains dgst on disk.
+func (s *store) HasBlobInSecondaryRoot(index int, dgst digest.Digest) bool {
+	if index < 0 || index >= len(s.secondaryRoots) {
+		return false
+	}
+	sp, err := s.blobPathInRoot(s.secondaryRoots[index], dgst)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(sp)
+	return err == nil
+}
+
+// InspectSecondaryRootBlob checks if dgst exists in any configured secondary root
+// and returns its Info and secondary root index without mutating deletedReadOnly.
+func (s *store) InspectSecondaryRootBlob(dgst digest.Digest) (content.Info, int, bool) {
+	for i, sr := range s.secondaryRoots {
+		sp, err := s.blobPathInRoot(sr, dgst)
+		if err != nil {
+			continue
+		}
+		if fi, err := os.Stat(sp); err == nil {
+			return s.info(dgst, fi, nil), i, true
+		}
+	}
+	return content.Info{}, -1, false
+}
+
+// RestoreFromSecondaryRoot checks if dgst exists in any configured secondary root,
+// and if so, unmarks it from deletedReadOnly and returns its Info and secondary root index.
+func (s *store) RestoreFromSecondaryRoot(dgst digest.Digest) (content.Info, int, bool) {
+	info, i, ok := s.InspectSecondaryRootBlob(dgst)
+	if ok {
+		s.unmarkDeletedReadOnly(dgst)
+	}
+	return info, i, ok
+}
+
+// OpenSecondaryRootReader opens a ReaderAt for dgst from the first configured
+// secondary root that contains it, without mutating deletedReadOnly.
+func (s *store) OpenSecondaryRootReader(dgst digest.Digest) (content.ReaderAt, error) {
+	for _, sr := range s.secondaryRoots {
+		sp, err := s.blobPathInRoot(sr, dgst)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(sp); err == nil {
+			return OpenReader(sp)
+		}
+	}
+	return nil, fmt.Errorf("content %v: %w", dgst, errdefs.ErrNotFound)
+}
+
+// ResolveBlobSecondaryRoot returns the index of the secondary root containing dgst
+// when dgst is not present in the primary root.
+func (s *store) ResolveBlobSecondaryRoot(dgst digest.Digest) (int, bool) {
+	if p, err := s.blobPath(dgst); err == nil {
+		if _, err := os.Stat(p); err == nil {
+			return -1, false
+		}
+	}
+	for i, sr := range s.secondaryRoots {
+		sp, err := s.blobPathInRoot(sr, dgst)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(sp); err == nil {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+func (s *store) resolveBlobPath(dgst digest.Digest) (string, os.FileInfo, error) {
 	p, err := s.blobPath(dgst)
 	if err != nil {
-		return content.Info{}, fmt.Errorf("calculating blob info path: %w", err)
+		return "", nil, err
+	}
+	if fi, err := os.Stat(p); err == nil {
+		return p, fi, nil
+	} else if !os.IsNotExist(err) {
+		return "", nil, err
 	}
 
-	fi, err := os.Stat(p)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err = fmt.Errorf("content %v: %w", dgst, errdefs.ErrNotFound)
+	if !s.isDeletedReadOnly(dgst) {
+		for _, sr := range s.secondaryRoots {
+			sp, err := s.blobPathInRoot(sr, dgst)
+			if err != nil {
+				return "", nil, err
+			}
+			if fi, err := os.Stat(sp); err == nil {
+				return sp, fi, nil
+			}
 		}
+	}
 
+	return "", nil, fmt.Errorf("content %v: %w", dgst, errdefs.ErrNotFound)
+}
+
+func (s *store) Info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
+	_, fi, err := s.resolveBlobPath(dgst)
+	if err != nil {
 		return content.Info{}, err
 	}
 	var labels map[string]string
@@ -144,7 +286,7 @@ func (s *store) info(dgst digest.Digest, fi os.FileInfo, labels map[string]strin
 
 // ReaderAt returns an io.ReaderAt for the blob.
 func (s *store) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
-	p, err := s.blobPath(desc.Digest)
+	p, _, err := s.resolveBlobPath(desc.Digest)
 	if err != nil {
 		return nil, fmt.Errorf("calculating blob path for ReaderAt: %w", err)
 	}
@@ -167,15 +309,55 @@ func (s *store) Delete(ctx context.Context, dgst digest.Digest) error {
 		return fmt.Errorf("calculating blob path for delete: %w", err)
 	}
 
-	if err := os.RemoveAll(bp); err != nil {
-		if !os.IsNotExist(err) {
+	var found bool
+	if _, err := os.Stat(bp); err == nil {
+		found = true
+		if err := os.RemoveAll(bp); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 
+	if !s.isDeletedReadOnly(dgst) {
+		for _, sr := range s.secondaryRoots {
+			sbp, err := s.blobPathInRoot(sr, dgst)
+			if err != nil {
+				return fmt.Errorf("calculating secondary blob path for delete: %w", err)
+			}
+			if _, err := os.Stat(sbp); err == nil {
+				found = true
+				s.markDeletedReadOnly(dgst)
+				break
+			}
+		}
+	}
+
+	if !found {
 		return fmt.Errorf("content %v: %w", dgst, errdefs.ErrNotFound)
 	}
 
 	return nil
+}
+
+// DeletePrimary removes a blob only from the primary root without marking it
+// deleted in secondary roots.
+func (s *store) DeletePrimary(ctx context.Context, dgst digest.Digest) error {
+	bp, err := s.blobPath(dgst)
+	if err != nil {
+		return fmt.Errorf("calculating blob path for delete: %w", err)
+	}
+
+	if _, err := os.Stat(bp); err == nil {
+		if err := os.RemoveAll(bp); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	return fmt.Errorf("content %v: %w", dgst, errdefs.ErrNotFound)
 }
 
 func (s *store) Update(ctx context.Context, info content.Info, fieldpaths ...string) (content.Info, error) {
@@ -183,17 +365,8 @@ func (s *store) Update(ctx context.Context, info content.Info, fieldpaths ...str
 		return content.Info{}, fmt.Errorf("update not supported on immutable content store: %w", errdefs.ErrFailedPrecondition)
 	}
 
-	p, err := s.blobPath(info.Digest)
+	p, fi, err := s.resolveBlobPath(info.Digest)
 	if err != nil {
-		return content.Info{}, fmt.Errorf("calculating blob path for update: %w", err)
-	}
-
-	fi, err := os.Stat(p)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err = fmt.Errorf("content %v: %w", info.Digest, errdefs.ErrNotFound)
-		}
-
 		return content.Info{}, err
 	}
 
@@ -238,71 +411,113 @@ func (s *store) Update(ctx context.Context, info content.Info, fieldpaths ...str
 	info = s.info(info.Digest, fi, labels)
 	info.UpdatedAt = time.Now()
 
-	if err := os.Chtimes(p, info.UpdatedAt, info.CreatedAt); err != nil {
-		log.G(ctx).WithError(err).Warnf("could not change access time for %s", info.Digest)
+	if bp, err := s.blobPath(info.Digest); err == nil && p == bp {
+		if err := os.Chtimes(p, info.UpdatedAt, info.CreatedAt); err != nil {
+			log.G(ctx).WithError(err).Warnf("could not change access time for %s", info.Digest)
+		}
 	}
 
 	return info, nil
 }
 
 func (s *store) Walk(ctx context.Context, fn content.WalkFunc, fs ...string) error {
-	root := filepath.Join(s.root, "blobs")
+	return s.walk(ctx, fn, true, fs...)
+}
 
+func (s *store) WalkPrimary(ctx context.Context, fn content.WalkFunc, fs ...string) error {
+	return s.walk(ctx, fn, false, fs...)
+}
+
+func (s *store) walk(ctx context.Context, fn content.WalkFunc, includeSecondary bool, fs ...string) error {
 	filter, err := filters.ParseAll(fs...)
 	if err != nil {
 		return err
 	}
 
-	var alg digest.Algorithm
-	return filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
-		if err != nil {
+	seen := map[digest.Digest]struct{}{}
+	walkRoot := func(rootDir string, isSecondary bool) error {
+		root := filepath.Join(rootDir, "blobs")
+		if _, err := os.Stat(root); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
-		if !fi.IsDir() && !alg.Available() {
-			return nil
-		}
 
-		// TODO(stevvooe): There are few more cases with subdirs that should be
-		// handled in case the layout gets corrupted. This isn't strict enough
-		// and may spew bad data.
-
-		if path == root {
-			return nil
-		}
-		if filepath.Dir(path) == root {
-			alg = digest.Algorithm(filepath.Base(path))
-
-			if !alg.Available() {
-				alg = ""
-				return filepath.SkipDir
+		var alg digest.Algorithm
+		return filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
+			if err != nil {
+				if isSecondary && os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			if !fi.IsDir() && !alg.Available() {
+				return nil
 			}
 
-			// descending into a hash directory
-			return nil
-		}
+			// TODO(stevvooe): There are few more cases with subdirs that should be
+			// handled in case the layout gets corrupted. This isn't strict enough
+			// and may spew bad data.
 
-		dgst := digest.NewDigestFromEncoded(alg, filepath.Base(path))
-		if err := dgst.Validate(); err != nil {
-			// log error but don't report
-			log.L.WithError(err).WithField("path", path).Error("invalid digest for blob path")
-			// if we see this, it could mean some sort of corruption of the
-			// store or extra paths not expected previously.
-		}
+			if path == root {
+				return nil
+			}
+			if filepath.Dir(path) == root {
+				alg = digest.Algorithm(filepath.Base(path))
 
-		var labels map[string]string
-		if s.ls != nil {
-			labels, err = s.ls.Get(dgst)
-			if err != nil {
+				if !alg.Available() {
+					alg = ""
+					return filepath.SkipDir
+				}
+
+				// descending into a hash directory
+				return nil
+			}
+
+			dgst := digest.NewDigestFromEncoded(alg, filepath.Base(path))
+			if err := dgst.Validate(); err != nil {
+				// log error but don't report
+				log.L.WithError(err).WithField("path", path).Error("invalid digest for blob path")
+				// if we see this, it could mean some sort of corruption of the
+				// store or extra paths not expected previously.
+			}
+
+			if isSecondary && s.isDeletedReadOnly(dgst) {
+				return nil
+			}
+			if _, ok := seen[dgst]; ok {
+				return nil
+			}
+			seen[dgst] = struct{}{}
+
+			var labels map[string]string
+			if s.ls != nil {
+				labels, err = s.ls.Get(dgst)
+				if err != nil {
+					return err
+				}
+			}
+
+			info := s.info(dgst, fi, labels)
+			if !filter.Match(content.AdaptInfo(info)) {
+				return nil
+			}
+			return fn(info)
+		})
+	}
+
+	if err := walkRoot(s.root, false); err != nil {
+		return err
+	}
+	if includeSecondary {
+		for _, sr := range s.secondaryRoots {
+			if err := walkRoot(sr, true); err != nil {
 				return err
 			}
 		}
-
-		info := s.info(dgst, fi, labels)
-		if !filter.Match(content.AdaptInfo(info)) {
-			return nil
-		}
-		return fn(info)
-	})
+	}
+	return nil
 }
 
 func (s *store) Status(ctx context.Context, ref string) (content.Status, error) {
@@ -534,12 +749,10 @@ func (s *store) writer(ctx context.Context, ref string, total int64, expected di
 	// TODO(stevvooe): Need to actually store expected here. We have
 	// code in the service that shouldn't be dealing with this.
 	if expected != "" {
-		p, err := s.blobPath(expected)
-		if err != nil {
-			return nil, fmt.Errorf("calculating expected blob path for writer: %w", err)
-		}
-		if _, err := os.Stat(p); err == nil {
+		if _, _, err := s.resolveBlobPath(expected); err == nil {
 			return nil, fmt.Errorf("content %v: %w", expected, errdefs.ErrAlreadyExists)
+		} else if !errdefs.IsNotFound(err) {
+			return nil, fmt.Errorf("calculating expected blob path for writer: %w", err)
 		}
 	}
 
@@ -644,11 +857,15 @@ func (s *store) Abort(ctx context.Context, ref string) error {
 }
 
 func (s *store) blobPath(dgst digest.Digest) (string, error) {
+	return s.blobPathInRoot(s.root, dgst)
+}
+
+func (s *store) blobPathInRoot(root string, dgst digest.Digest) (string, error) {
 	if err := dgst.Validate(); err != nil {
 		return "", fmt.Errorf("cannot calculate blob path from invalid digest: %v: %w", err, errdefs.ErrInvalidArgument)
 	}
 
-	return filepath.Join(s.root, "blobs", dgst.Algorithm().String(), dgst.Encoded()), nil
+	return filepath.Join(root, "blobs", dgst.Algorithm().String(), dgst.Encoded()), nil
 }
 
 func (s *store) ingestRoot(ref string) string {

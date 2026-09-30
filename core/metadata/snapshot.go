@@ -58,6 +58,19 @@ func newSnapshotter(db *DB, name string, sn snapshots.Snapshotter) *snapshotter 
 	}
 }
 
+func (s *snapshotter) SecondaryRoots() []string {
+	if s != nil && s.Snapshotter != nil {
+		if srs, ok := s.Snapshotter.(interface{ SecondaryRoots() []string }); ok {
+			return srs.SecondaryRoots()
+		}
+	}
+	return nil
+}
+
+func (s *snapshotter) HasSecondaryRoots() bool {
+	return s != nil && s.db != nil && s.db.hasSecondaryRoots()
+}
+
 func createKey(id uint64, namespace, key string) string {
 	return fmt.Sprintf("%s/%d/%s", namespace, id, key)
 }
@@ -321,7 +334,8 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 		bopts   = []snapshots.Opt{
 			snapshots.WithLabels(snapshots.FilterInheritedLabels(base.Labels)),
 		}
-		rerr error
+		rerr            error
+		pendingRemovals []pendingSnapRemove
 	)
 
 	if err := update(ctx, s.db, func(tx *bolt.Tx) error {
@@ -333,20 +347,40 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 		// Check if target exists, if so, return already exists
 		if target != "" {
 			if tbkt := bkt.Bucket([]byte(target)); tbkt != nil {
-				rerr = fmt.Errorf("target snapshot %q: %w", target, errdefs.ErrAlreadyExists)
-				if err := addSnapshotLease(ctx, tx, s.name, target); err != nil {
-					return err
+				tbkey := string(tbkt.Get(bucketKeyName))
+				if s.db.hasSecondaryRoots() && hasSnapshotChainSecondaryRoot(bkt, target) {
+					if _, statErr := s.Snapshotter.Stat(ctx, tbkey); statErr != nil && errdefs.IsNotFound(statErr) {
+						rems, _ := s.removeStaleSnapshotTree(ctx, tx, ns, bkt, target)
+						pendingRemovals = append(pendingRemovals, rems...)
+						tbkt = nil
+					}
 				}
-				return nil
+				if tbkt != nil {
+					rerr = fmt.Errorf("target snapshot %q: %w", target, errdefs.ErrAlreadyExists)
+					if err := addSnapshotLease(ctx, tx, s.name, target); err != nil {
+						return err
+					}
+					return nil
+				}
 			}
 		}
 
 		if bbkt := bkt.Bucket([]byte(key)); bbkt != nil {
-			rerr = fmt.Errorf("snapshot %q: %w", key, errdefs.ErrAlreadyExists)
-			if err := addSnapshotLease(ctx, tx, s.name, key); err != nil {
-				return err
+			bbkey := string(bbkt.Get(bucketKeyName))
+			if s.db.hasSecondaryRoots() && hasSnapshotChainSecondaryRoot(bkt, key) {
+				if _, statErr := s.Snapshotter.Stat(ctx, bbkey); statErr != nil && errdefs.IsNotFound(statErr) {
+					rems, _ := s.removeStaleSnapshotTree(ctx, tx, ns, bkt, key)
+					pendingRemovals = append(pendingRemovals, rems...)
+					bbkt = nil
+				}
 			}
-			return nil
+			if bbkt != nil {
+				rerr = fmt.Errorf("snapshot %q: %w", key, errdefs.ErrAlreadyExists)
+				if err := addSnapshotLease(ctx, tx, s.name, key); err != nil {
+					return err
+				}
+				return nil
+			}
 		}
 
 		if parent != "" {
@@ -355,6 +389,14 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 				return fmt.Errorf("parent snapshot %v does not exist: %w", parent, errdefs.ErrNotFound)
 			}
 			bparent = string(pbkt.Get(bucketKeyName))
+			if s.db.hasSecondaryRoots() && hasSnapshotChainSecondaryRoot(bkt, parent) {
+				if _, statErr := s.Snapshotter.Stat(ctx, bparent); statErr != nil && errdefs.IsNotFound(statErr) {
+					rems, _ := s.removeStaleSnapshotTree(ctx, tx, ns, bkt, parent)
+					pendingRemovals = append(pendingRemovals, rems...)
+					rerr = fmt.Errorf("parent snapshot %v does not exist: %w", parent, errdefs.ErrNotFound)
+					return nil
+				}
+			}
 		}
 
 		sid, err := bkt.NextSequence()
@@ -367,7 +409,10 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 	}); err != nil {
 		return nil, err
 	}
-	// Already exists and lease successfully added in transaction
+	for _, r := range pendingRemovals {
+		r.execute(ctx)
+	}
+	// Already exists or missing parent handled in transaction
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -463,6 +508,12 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 			return nil
 		}
 
+		if (rerr != nil && clearSnapshotTombstone(tx, ns, s.name, key)) || consumeSnapshotOrigin(tx, ns, s.name, key) || (target != "" && consumeSnapshotOrigin(tx, ns, s.name, target)) {
+			if err := markFromSecondary(bbkt); err != nil {
+				return err
+			}
+		}
+
 		if parent != "" {
 			pbkt := bkt.Bucket([]byte(parent))
 			if pbkt == nil {
@@ -538,16 +589,31 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	}
 
 	var (
-		bname   string
-		bparent string
-		rebase  bool
-		rerr    error
+		bname           string
+		bparent         string
+		rebase          bool
+		rerr            error
+		pendingRemovals []pendingSnapRemove
+		fromSecondary   bool
 	)
 	if err := update(ctx, s.db, func(tx *bolt.Tx) error {
 		bkt := getSnapshotterBucket(tx, ns, s.name)
 		if bkt == nil {
 			return fmt.Errorf("can not find snapshotter %q: %w",
 				s.name, errdefs.ErrNotFound)
+		}
+
+		if s.db.hasSecondaryRoots() {
+			if existing := bkt.Bucket([]byte(name)); existing != nil && hasSnapshotChainSecondaryRoot(bkt, name) {
+				ebkey := string(existing.Get(bucketKeyName))
+				if _, statErr := s.Snapshotter.Stat(ctx, ebkey); statErr != nil && errdefs.IsNotFound(statErr) {
+					if hasSecondaryOrigin(existing) || len(existing.Get(bucketKeySourceRoot)) > 0 {
+						fromSecondary = true
+					}
+					rems, _ := s.removeStaleSnapshotTree(ctx, tx, ns, bkt, name)
+					pendingRemovals = append(pendingRemovals, rems...)
+				}
+			}
 		}
 
 		if err := addSnapshotLease(ctx, tx, s.name, name); err != nil {
@@ -565,6 +631,16 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		obkt := bkt.Bucket([]byte(key))
 		if obkt == nil {
 			return fmt.Errorf("snapshot %v does not exist: %w", key, errdefs.ErrNotFound)
+		}
+		if hasSecondaryOrigin(obkt) {
+			fromSecondary = true
+		}
+
+		if clearSnapshotTombstone(tx, ns, s.name, name) || consumeSnapshotOrigin(tx, ns, s.name, name) || fromSecondary {
+			fromSecondary = true
+			if err := markFromSecondary(bbkt); err != nil {
+				return err
+			}
 		}
 
 		bkey := string(obkt.Get(bucketKeyName))
@@ -654,6 +730,9 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 			return err
 		}
 		bname = nameKey
+		if fromSecondary || (s.db.hasSecondaryRoots() && hasSnapshotChainSecondaryRoot(bkt, name)) {
+			s.db.refreshNamespaceImageSourceRoots(ctx, tx, ns)
+		}
 
 		return nil
 	}); err != nil {
@@ -662,6 +741,9 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 
 		}
 		return err
+	}
+	for _, r := range pendingRemovals {
+		r.execute(ctx)
 	}
 
 	if rerr == nil {
@@ -720,11 +802,19 @@ func (s *snapshotter) Remove(ctx context.Context, key string) error {
 			}
 		}
 
+		fromSecondary := hasSecondaryOrigin(sbkt)
+
 		if err := bkt.DeleteBucket([]byte(key)); err != nil {
 			return err
 		}
 		if err := removeSnapshotLease(ctx, tx, s.name, key); err != nil {
 			return err
+		}
+
+		if fromSecondary {
+			if err := putExplicitSnapshotTombstone(tx, ns, s.name, key); err != nil {
+				return err
+			}
 		}
 
 		// Mark snapshotter as dirty for triggering garbage collection
@@ -946,11 +1036,19 @@ type treeNode struct {
 	children []*treeNode
 }
 
+type allSnapshotsWalker interface {
+	WalkAll(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error
+}
+
 func (s *snapshotter) walkTree(ctx context.Context, seen map[string]struct{}) ([]*treeNode, error) {
 	roots := []*treeNode{}
 	nodes := map[string]*treeNode{}
 
-	if err := s.Snapshotter.Walk(ctx, func(ctx context.Context, info snapshots.Info) error {
+	walkFn := s.Snapshotter.Walk
+	if walker, ok := s.Snapshotter.(allSnapshotsWalker); ok {
+		walkFn = walker.WalkAll
+	}
+	if err := walkFn(ctx, func(ctx context.Context, info snapshots.Info) error {
 		_, isSeen := seen[info.Name]
 		node, ok := nodes[info.Name]
 		if !ok {

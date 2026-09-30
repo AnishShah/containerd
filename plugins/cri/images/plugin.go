@@ -115,6 +115,7 @@ func init() {
 			options.Client = ctrdCli
 
 			allSnapshotters := mdb.Snapshotters()
+			options.AllSnapshotters = allSnapshotters
 			defaultSnapshotter := config.Snapshotter
 			if s, ok := allSnapshotters[defaultSnapshotter]; ok {
 				options.Snapshotters[defaultSnapshotter] = s
@@ -140,6 +141,10 @@ func init() {
 				snapshotter := rp.Snapshotter
 				if snapshotter == "" {
 					snapshotter = defaultSnapshotter
+				}
+
+				if s, ok := allSnapshotters[snapshotter]; ok {
+					options.Snapshotters[snapshotter] = s
 				}
 
 				if _, ok := options.ImageFSPaths[snapshotter]; !ok {

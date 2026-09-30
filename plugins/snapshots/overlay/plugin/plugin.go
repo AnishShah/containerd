@@ -20,6 +20,7 @@ package overlay
 
 import (
 	"errors"
+	"path/filepath"
 
 	"github.com/moby/sys/userns"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/snapshots/overlay"
 	"github.com/containerd/containerd/v2/plugins/snapshots/overlay/overlayutils"
+	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
@@ -72,6 +74,13 @@ func init() {
 			}
 
 			var oOpts []overlay.Opt
+			if srProp := ic.Properties[plugins.PropertySecondaryRootDirs]; srProp != "" {
+				if config.RootPath == "" {
+					oOpts = append(oOpts, overlay.WithSecondaryRoots(filepath.SplitList(srProp)))
+				} else {
+					log.G(ic.Context).WithField("root_path", config.RootPath).Warn("ignoring secondary_roots for overlayfs snapshotter because root_path is explicitly configured")
+				}
+			}
 			if config.UpperdirLabel {
 				oOpts = append(oOpts, overlay.WithUpperdirLabel)
 			}

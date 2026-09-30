@@ -100,6 +100,9 @@ const (
 const (
 	// PropertyRootDir sets the root directory property for a plugin
 	PropertyRootDir = "io.containerd.plugin.root"
+	// PropertySecondaryRootDirs sets the secondary root directory properties for a plugin,
+	// separated by filepath.ListSeparator
+	PropertySecondaryRootDirs = "io.containerd.plugin.secondary-roots"
 	// PropertyStateDir sets the state directory property for a plugin
 	PropertyStateDir = "io.containerd.plugin.state"
 	// PropertyGRPCAddress is the grpc address used for client connections to containerd

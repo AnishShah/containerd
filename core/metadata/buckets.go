@@ -55,6 +55,9 @@
 //	   • `version` is a key to a numeric value identifying the minor revisions
 //	     of schema version
 //	   • a namespace in a schema bucket cannot be named "version"
+//	   • `source_root`, `from_secondary`, and `tombstones` are optional keys/buckets
+//	     used only when `secondary_roots` is configured (and pruned when unconfigured),
+//	     so they are backward-compatible and do not require incrementing `dbVersion`
 //
 //	Schema
 //	└──v1                                             - Schema version bucket
@@ -66,6 +69,8 @@
 //	      │  ╘══*image name*
 //	      │     ├──createdat : <binary time>          - Created at
 //	      │     ├──updatedat : <binary time>          - Updated at
+//	      │     ├──source_root : <string>             - Secondary root path (optional)
+//	      │     ├──from_secondary : <byte>            - Secondary origin marker (optional)
 //	      │     ├──target
 //	      │     │  ├──digest : <digest>               - Descriptor digest
 //	      │     │  ├──mediatype : <string>            - Descriptor media type
@@ -94,6 +99,8 @@
 //	      │        ├──createdat : <binary time>       - Created at
 //	      │        ├──updatedat : <binary time>       - Updated at
 //	      │        ├──parent : <string>               - Parent snapshot name
+//	      │        ├──source_root : <string>          - Secondary root path (optional)
+//	      │        ├──from_secondary : <byte>         - Secondary origin marker (optional)
 //	      │        ├──children
 //	      │        │  ╘══*snapshot key* : <nil>       - Child snapshot reference
 //	      │        └──labels
@@ -104,6 +111,8 @@
 //	      │  │     ├──createdat : <binary time>       - Created at
 //	      │  │     ├──updatedat : <binary time>       - Updated at
 //	      │  │     ├──size : <varint>                 - Blob size
+//	      │  │     ├──source_root : <string>          - Secondary root path (optional)
+//	      │  │     ├──from_secondary : <byte>         - Secondary origin marker (optional)
 //	      │  │     └──labels
 //	      │  │        ╘══*key* : <string>             - Label value
 //	      │  └──ingests
@@ -124,6 +133,22 @@
 //	      │     │  ╘══*name* : <binary>               - Proto marshaled extension
 //	      │     └──labels
 //	      │        ╘══*key* : <string>                - Label value
+//	      ├──tombstones
+//	      │  ├──images
+//	      │  │  ╘══*image name* : <byte>              - Deleted secondary image tombstone
+//	      │  ├──content
+//	      │  │  ╘══*blob digest* : <byte>             - Deleted secondary content tombstone
+//	      │  ├──snapshots
+//	      │  │  ╘══*snapshotter*
+//	      │  │     ╘══*snapshot key* : <byte>         - Deleted secondary snapshot tombstone
+//	      │  └──from_secondary
+//	      │     ├──images
+//	      │     │  ╘══*image name* : <byte>           - Secondary origin marker for replaced image
+//	      │     ├──content
+//	      │     │  ╘══*blob digest* : <byte>          - Secondary origin marker for uncommitted/replaced content
+//	      │     └──snapshots
+//	      │        ╘══*snapshotter*
+//	      │           ╘══*snapshot key* : <byte>      - Secondary origin marker for uncommitted/replaced snapshot
 //	      └──leases
 //	         ╘══*lease id*
 //	             ├──createdat : <binary time>         - Created at
@@ -155,27 +180,30 @@ var (
 	bucketKeyObjectIngests    = []byte("ingests")    // stores ingest objects
 	bucketKeyObjectLeases     = []byte("leases")     // stores leases
 	bucketKeyObjectSandboxes  = []byte("sandboxes")  // stores sandboxes
+	bucketKeyObjectTombstones = []byte("tombstones") // stores deletion markers for secondary roots
 
-	bucketKeyDigest      = []byte("digest")
-	bucketKeyMediaType   = []byte("mediatype")
-	bucketKeySize        = []byte("size")
-	bucketKeyImage       = []byte("image")
-	bucketKeyRuntime     = []byte("runtime")
-	bucketKeyName        = []byte("name")
-	bucketKeyParent      = []byte("parent")
-	bucketKeyChildren    = []byte("children")
-	bucketKeyOptions     = []byte("options")
-	bucketKeySpec        = []byte("spec")
-	bucketKeySnapshotKey = []byte("snapshotKey")
-	bucketKeySnapshotter = []byte("snapshotter")
-	bucketKeyTarget      = []byte("target")
-	bucketKeyExtensions  = []byte("extensions")
-	bucketKeyCreatedAt   = []byte("createdat")
-	bucketKeyExpected    = []byte("expected")
-	bucketKeyRef         = []byte("ref")
-	bucketKeyExpireAt    = []byte("expireat")
-	bucketKeySandboxID   = []byte("sandboxid")
-	bucketKeySandboxer   = []byte("sandboxer")
+	bucketKeyDigest        = []byte("digest")
+	bucketKeyMediaType     = []byte("mediatype")
+	bucketKeySize          = []byte("size")
+	bucketKeyImage         = []byte("image")
+	bucketKeyRuntime       = []byte("runtime")
+	bucketKeyName          = []byte("name")
+	bucketKeyParent        = []byte("parent")
+	bucketKeyChildren      = []byte("children")
+	bucketKeyOptions       = []byte("options")
+	bucketKeySpec          = []byte("spec")
+	bucketKeySnapshotKey   = []byte("snapshotKey")
+	bucketKeySnapshotter   = []byte("snapshotter")
+	bucketKeyTarget        = []byte("target")
+	bucketKeyExtensions    = []byte("extensions")
+	bucketKeyCreatedAt     = []byte("createdat")
+	bucketKeyExpected      = []byte("expected")
+	bucketKeyRef           = []byte("ref")
+	bucketKeyExpireAt      = []byte("expireat")
+	bucketKeySandboxID     = []byte("sandboxid")
+	bucketKeySandboxer     = []byte("sandboxer")
+	bucketKeySourceRoot    = []byte("source_root")
+	bucketKeyFromSecondary = []byte("from_secondary")
 
 	deprecatedBucketKeyObjectIngest = []byte("ingest") // stores ingest links, deprecated in v1.2
 )

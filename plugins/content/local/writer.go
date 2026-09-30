@@ -147,6 +147,7 @@ func (w *writer) Commit(ctx context.Context, size int64, expected digest.Digest,
 
 	if _, err := os.Stat(target); err == nil {
 		// collision with the target file!
+		w.s.unmarkDeletedReadOnly(dgst)
 		if err := os.RemoveAll(w.path); err != nil {
 			log.G(ctx).WithField("ref", w.ref).WithField("path", w.path).Error("failed to remove ingest directory")
 		}
@@ -156,6 +157,7 @@ func (w *writer) Commit(ctx context.Context, size int64, expected digest.Digest,
 	if err := os.Rename(ingest, target); err != nil {
 		return err
 	}
+	w.s.unmarkDeletedReadOnly(dgst)
 
 	if err := syncDir(filepath.Dir(target)); err != nil {
 		return err

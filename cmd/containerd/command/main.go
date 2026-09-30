@@ -18,6 +18,7 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -26,6 +27,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/cmd/containerd/server"
@@ -159,6 +161,10 @@ can be used and modified as necessary as a custom configuration.`,
 
 			// Apply flags to the config
 			if err := applyFlags(cmd, config); err != nil {
+				return err
+			}
+			// Validate config and fail early.
+			if err := validateConfig(config); err != nil {
 				return err
 			}
 
@@ -347,6 +353,54 @@ func applyFlags(cmd *cli.Command, config *srvconfig.Config) error {
 
 	applyPlatformFlags(cmd)
 
+	return nil
+}
+
+func validateConfig(config *srvconfig.Config) error {
+	switch {
+	case config.Root == "":
+		return errors.New("root must be specified")
+	case config.State == "":
+		return errors.New("state must be specified")
+	case filepath.Clean(config.Root) == filepath.Clean(config.State):
+		return errors.New("root and state must be different paths")
+	}
+
+	if len(config.SecondaryRoots) == 0 {
+		return nil
+	}
+
+	cleanRoot := filepath.Clean(config.Root)
+	cleanState := filepath.Clean(config.State)
+	seen := make(map[string]struct{}, len(config.SecondaryRoots))
+	for _, sr := range config.SecondaryRoots {
+		if sr == "" {
+			return errors.New("secondary_roots entry must not be empty")
+		}
+		// Reject path list separators (':' on Unix, used by overlayfs lowerdir=)
+		// and ',' (used as mount option delimiter).
+		if strings.ContainsRune(sr, filepath.ListSeparator) || strings.ContainsRune(sr, ',') {
+			return fmt.Errorf("secondary_roots entry %q must not contain %q or ','", sr, filepath.ListSeparator)
+		}
+		cleanSR := filepath.Clean(sr)
+		if cleanSR == cleanRoot {
+			return fmt.Errorf("secondary_roots entry %q must be different from root %q", sr, config.Root)
+		}
+		if cleanSR == cleanState {
+			return fmt.Errorf("secondary_roots entry %q must be different from state %q", sr, config.State)
+		}
+		if _, ok := seen[cleanSR]; ok {
+			return fmt.Errorf("duplicate secondary_roots entry %q", sr)
+		}
+		fi, err := os.Stat(cleanSR)
+		if err != nil {
+			return fmt.Errorf("invalid secondary_roots entry %q: %w", sr, err)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("secondary_roots entry %q is not a directory", sr)
+		}
+		seen[cleanSR] = struct{}{}
+	}
 	return nil
 }
 

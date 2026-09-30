@@ -191,6 +191,10 @@ func init() {
 				metadata.WithEventsPublisher(ep.(events.Publisher)),
 			}
 
+			if srProp := ic.Properties[plugins.PropertySecondaryRootDirs]; srProp != "" {
+				dbopts = append(dbopts, metadata.WithSecondaryRoots(filepath.SplitList(srProp)))
+			}
+
 			if !shared {
 				dbopts = append(dbopts, metadata.WithPolicyIsolated)
 			}

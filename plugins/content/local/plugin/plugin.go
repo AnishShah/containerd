@@ -17,6 +17,8 @@
 package plugin
 
 import (
+	"path/filepath"
+
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
@@ -30,8 +32,9 @@ func init() {
 		ID:   "content",
 		InitFn: func(ic *plugin.InitContext) (any, error) {
 			root := ic.Properties[plugins.PropertyRootDir]
+			secondaryRoots := filepath.SplitList(ic.Properties[plugins.PropertySecondaryRootDirs])
 			ic.Meta.Exports["root"] = root
-			return local.NewStore(root)
+			return local.NewStoreWithSecondaryRoots(root, secondaryRoots)
 		},
 	})
 }

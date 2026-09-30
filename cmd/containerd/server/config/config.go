@@ -61,6 +61,8 @@ type Config struct {
 	Version int `toml:"version"`
 	// Root is the path to a directory where containerd will store persistent data
 	Root string `toml:"root"`
+	// SecondaryRoots is a list of ordered paths to directories containing preloaded data
+	SecondaryRoots []string `toml:"secondary_roots"`
 	// State is the path to a directory where containerd will store transient data
 	State string `toml:"state"`
 	// TempDir is the path to a directory where to place containerd temporary files
@@ -602,9 +604,36 @@ func resolveImports(parent string, imports []string) ([]string, error) {
 // []{}         []{"2"}     []{"2"}
 // Maps merged by keys, but values are replaced entirely.
 func mergeConfig(to, from *Config) error {
+	// Deduplicate cross-file SecondaryRoots entries against to.SecondaryRoots
+	// per mergeConfig slice rules while preserving any intra-file duplicates
+	// in from.SecondaryRoots so validateConfig can reject them.
+	var mergedSecondaryRoots []string
+	if len(to.SecondaryRoots) > 0 || len(from.SecondaryRoots) > 0 {
+		origDst := to.SecondaryRoots
+		origClean := make(map[string]struct{}, len(origDst))
+		for _, sr := range origDst {
+			if sr != "" {
+				origClean[filepath.Clean(sr)] = struct{}{}
+			}
+		}
+		mergedSecondaryRoots = make([]string, 0, len(origDst)+len(from.SecondaryRoots))
+		mergedSecondaryRoots = append(mergedSecondaryRoots, origDst...)
+		for _, sr := range from.SecondaryRoots {
+			if sr != "" {
+				if _, ok := origClean[filepath.Clean(sr)]; ok {
+					continue
+				}
+			}
+			mergedSecondaryRoots = append(mergedSecondaryRoots, sr)
+		}
+	}
+
 	err := mergo.Merge(to, from, mergo.WithOverride, mergo.WithTransformers(sliceTransformer{}))
 	if err != nil {
 		return err
+	}
+	if mergedSecondaryRoots != nil {
+		to.SecondaryRoots = mergedSecondaryRoots
 	}
 
 	// Replace entire sections instead of merging map's values.

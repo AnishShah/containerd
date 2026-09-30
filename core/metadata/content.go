@@ -46,6 +46,10 @@ type contentStore struct {
 	l      sync.RWMutex
 }
 
+func (cs *contentStore) HasSecondaryRoots() bool {
+	return cs != nil && cs.db != nil && cs.db.hasSecondaryRoots()
+}
+
 // newContentStore returns a namespaced content store using an existing
 // content store interface.
 // policy defines the sharing behavior for content between namespaces. Both
@@ -81,6 +85,9 @@ func (cs *contentStore) Info(ctx context.Context, dgst digest.Digest) (content.I
 		if bkt == nil {
 			return fmt.Errorf("content digest %v: %w", dgst, errdefs.ErrNotFound)
 		}
+		if !cs.db.isSecondaryBlobAvailable(ctx, bkt, dgst) {
+			return fmt.Errorf("content digest %v: %w", dgst, errdefs.ErrNotFound)
+		}
 
 		info.Digest = dgst
 		return readInfo(&info, bkt)
@@ -106,6 +113,9 @@ func (cs *contentStore) Update(ctx context.Context, info content.Info, fieldpath
 	if err := update(ctx, cs.db, func(tx *bolt.Tx) error {
 		bkt := getBlobBucket(tx, ns, info.Digest)
 		if bkt == nil {
+			return fmt.Errorf("content digest %v: %w", info.Digest, errdefs.ErrNotFound)
+		}
+		if !cs.db.isSecondaryBlobAvailable(ctx, bkt, info.Digest) {
 			return fmt.Errorf("content digest %v: %w", info.Digest, errdefs.ErrNotFound)
 		}
 
@@ -141,7 +151,13 @@ func (cs *contentStore) Update(ctx context.Context, info content.Info, fieldpath
 		}
 
 		updated.UpdatedAt = time.Now().UTC()
-		return writeInfo(&updated, bkt)
+		if err := writeInfo(&updated, bkt); err != nil {
+			return err
+		}
+		if cs.db.hasSecondaryRoots() && (hasGCRefLabel(updated.Labels) || len(bkt.Get(bucketKeySourceRoot)) > 0) {
+			cs.db.refreshNamespaceImageSourceRoots(ctx, tx, ns)
+		}
+		return nil
 	}); err != nil {
 		return content.Info{}, err
 	}
@@ -177,10 +193,13 @@ func (cs *contentStore) Walk(ctx context.Context, fn content.WalkFunc, fs ...str
 			if bbkt == nil {
 				return nil
 			}
+			if !cs.db.isSecondaryBlobAvailable(ctx, bbkt, dgst) {
+				return nil
+			}
 			info := content.Info{
 				Digest: dgst,
 			}
-			if err := readInfo(&info, bkt.Bucket(k)); err != nil {
+			if err := readInfo(&info, bbkt); err != nil {
 				return err
 			}
 			if filter.Match(content.AdaptInfo(info)) {
@@ -210,17 +229,26 @@ func (cs *contentStore) Delete(ctx context.Context, dgst digest.Digest) error {
 	cs.l.RLock()
 	defer cs.l.RUnlock()
 
+	var fromSecondary bool
 	if err := update(ctx, cs.db, func(tx *bolt.Tx) error {
 		bkt := getBlobBucket(tx, ns, dgst)
 		if bkt == nil {
 			return fmt.Errorf("content digest %v: %w", dgst, errdefs.ErrNotFound)
 		}
 
+		fromSecondary = hasSecondaryOrigin(bkt)
+
 		if err := getBlobsBucket(tx, ns).DeleteBucket([]byte(dgst.String())); err != nil {
 			return err
 		}
 		if err := removeContentLease(ctx, tx, dgst); err != nil {
 			return err
+		}
+
+		if fromSecondary {
+			if err := putExplicitContentTombstone(tx, ns, dgst); err != nil {
+				return err
+			}
 		}
 
 		// Mark content store as dirty for triggering garbage collection
@@ -230,6 +258,10 @@ func (cs *contentStore) Delete(ctx context.Context, dgst digest.Digest) error {
 		return nil
 	}); err != nil {
 		return err
+	}
+
+	if fromSecondary {
+		_ = cs.db.syncDeletedDigests()
 	}
 
 	if publisher := cs.db.Publisher(ctx); publisher != nil {
@@ -338,7 +370,7 @@ func (cs *contentStore) Abort(ctx context.Context, ref string) error {
 	cs.l.RLock()
 	defer cs.l.RUnlock()
 
-	return update(ctx, cs.db, func(tx *bolt.Tx) error {
+	if err := update(ctx, cs.db, func(tx *bolt.Tx) error {
 		ibkt := getIngestsBucket(tx, ns)
 		if ibkt == nil {
 			return fmt.Errorf("reference %v: %w", ref, errdefs.ErrNotFound)
@@ -366,8 +398,13 @@ func (cs *contentStore) Abort(ctx context.Context, ref string) error {
 		}
 
 		return nil
-	})
-
+	}); err != nil {
+		return err
+	}
+	if cs.db.hasSecondaryRoots() {
+		_ = cs.db.syncDeletedDigests()
+	}
+	return nil
 }
 
 func (cs *contentStore) Writer(ctx context.Context, opts ...content.WriterOpt) (content.Writer, error) {
@@ -391,14 +428,28 @@ func (cs *contentStore) Writer(ctx context.Context, opts ...content.WriterOpt) (
 	defer cs.l.RUnlock()
 
 	var (
-		w      content.Writer
-		exists bool
-		bref   string
+		w                content.Writer
+		exists           bool
+		bref             string
+		sharedSourceRoot string
+		fromSecondary    bool
 	)
 	if err := update(ctx, cs.db, func(tx *bolt.Tx) error {
 		var shared bool
 		if wOpts.Desc.Digest != "" {
 			cbkt := getBlobBucket(tx, ns, wOpts.Desc.Digest)
+			if cbkt != nil && !cs.db.isSecondaryBlobAvailable(ctx, cbkt, wOpts.Desc.Digest) {
+				fromSecondary = hasSecondaryOrigin(cbkt) || len(cbkt.Get(bucketKeySourceRoot)) > 0
+				if fromSecondary {
+					_ = putContentOrigin(tx, ns, wOpts.Desc.Digest)
+				}
+				deleteContentFromAllLeases(tx, ns, wOpts.Desc.Digest)
+				if blobsBkt := getBlobsBucket(tx, ns); blobsBkt != nil {
+					_ = blobsBkt.DeleteBucket([]byte(wOpts.Desc.Digest.String()))
+				}
+				cs.db.markUnavailableSecondaryImages(ctx, tx, ns)
+				cbkt = nil
+			}
 			if cbkt != nil {
 				// Add content to lease to prevent other reference removals
 				// from effecting this object during a provided lease
@@ -411,14 +462,32 @@ func (cs *contentStore) Writer(ctx context.Context, opts ...content.WriterOpt) (
 				return nil
 			}
 
-			if cs.shared || isSharedContent(tx, wOpts.Desc.Digest) {
-				if st, err := cs.Store.Info(ctx, wOpts.Desc.Digest); err == nil {
-					// Ensure the expected size is the same, it is likely
-					// an error if the size is mismatched but the caller
-					// must resolve this on commit
-					if wOpts.Desc.Size == 0 || wOpts.Desc.Size == st.Size {
-						shared = true
-						wOpts.Desc.Size = st.Size
+			if cs.shared || cs.isSharedContent(ctx, tx, wOpts.Desc.Digest) {
+				foundActive, sr := cs.db.findSharedContentSourceRoot(ctx, tx, wOpts.Desc.Digest)
+				tombstoned := isContentTombstoned(tx, ns, wOpts.Desc.Digest)
+				if !tombstoned || (foundActive && sr == "") {
+					st, err := cs.Store.Info(ctx, wOpts.Desc.Digest)
+					if err != nil && !tombstoned {
+						if inspectedInfo, inspectedRoot, ok := cs.db.inspectSecondaryRootBlob(wOpts.Desc.Digest); ok {
+							st = inspectedInfo
+							err = nil
+							if sr == "" {
+								sr = inspectedRoot
+							}
+						}
+					}
+					if err == nil {
+						if sr == "" && !tombstoned {
+							sr = cs.db.resolveBlobSourceRoot(wOpts.Desc.Digest)
+						}
+						// Ensure the expected size is the same, it is likely
+						// an error if the size is mismatched but the caller
+						// must resolve this on commit
+						if wOpts.Desc.Size == 0 || wOpts.Desc.Size == st.Size {
+							shared = true
+							sharedSourceRoot = sr
+							wOpts.Desc.Size = st.Size
+						}
 					}
 				}
 			}
@@ -483,16 +552,18 @@ func (cs *contentStore) Writer(ctx context.Context, opts ...content.WriterOpt) (
 	}
 
 	return &namespacedWriter{
-		ctx:       ctx,
-		ref:       wOpts.Ref,
-		namespace: ns,
-		db:        cs.db,
-		provider:  cs.Store,
-		l:         &cs.l,
-		w:         w,
-		bref:      bref,
-		started:   time.Now(),
-		desc:      wOpts.Desc,
+		ctx:              ctx,
+		ref:              wOpts.Ref,
+		namespace:        ns,
+		db:               cs.db,
+		provider:         cs.Store,
+		l:                &cs.l,
+		w:                w,
+		bref:             bref,
+		started:          time.Now(),
+		desc:             wOpts.Desc,
+		sharedSourceRoot: sharedSourceRoot,
+		fromSecondary:    fromSecondary,
 	}, nil
 }
 
@@ -509,9 +580,11 @@ type namespacedWriter struct {
 
 	w content.Writer
 
-	bref    string
-	started time.Time
-	desc    ocispec.Descriptor
+	bref             string
+	started          time.Time
+	desc             ocispec.Descriptor
+	sharedSourceRoot string
+	fromSecondary    bool
 }
 
 func (nw *namespacedWriter) Close() error {
@@ -562,7 +635,17 @@ func (nw *namespacedWriter) createAndCopy(ctx context.Context, desc ocispec.Desc
 	}
 
 	if desc.Size > 0 {
-		ra, err := nw.provider.ReaderAt(ctx, nw.desc)
+		var ra content.ReaderAt
+		if nw.sharedSourceRoot != "" {
+			if srr, ok := nw.provider.(interface {
+				OpenSecondaryRootReader(digest.Digest) (content.ReaderAt, error)
+			}); ok {
+				ra, err = srr.OpenSecondaryRootReader(nw.desc.Digest)
+			}
+		}
+		if ra == nil && err == nil {
+			ra, err = nw.provider.ReaderAt(ctx, nw.desc)
+		}
 		if err != nil {
 			w.Close()
 			return err
@@ -624,6 +707,9 @@ func (nw *namespacedWriter) Commit(ctx context.Context, size int64, expected dig
 	}); err != nil {
 		return err
 	}
+	if nw.w == nil && nw.sharedSourceRoot != "" && innerErr == nil {
+		nw.db.restoreSecondaryRootBlob(actualDgst)
+	}
 	if innerErr != nil {
 		return innerErr
 	}
@@ -665,6 +751,7 @@ func (nw *namespacedWriter) commit(ctx context.Context, tx *bolt.Tx, size int64,
 		return "", 0, err
 	}
 
+	fromSecondary := nw.fromSecondary
 	var actual digest.Digest
 	if nw.w == nil {
 		if size != 0 && size != nw.desc.Size {
@@ -675,6 +762,17 @@ func (nw *namespacedWriter) commit(ctx context.Context, tx *bolt.Tx, size int64,
 		}
 		size = nw.desc.Size
 		actual = nw.desc.Digest
+		if existing := getBlobBucket(tx, nw.namespace, actual); existing != nil && !nw.db.isSecondaryBlobAvailable(ctx, existing, actual) {
+			if hasSecondaryOrigin(existing) || len(existing.Get(bucketKeySourceRoot)) > 0 {
+				fromSecondary = true
+				_ = putContentOrigin(tx, nw.namespace, actual)
+			}
+			deleteContentFromAllLeases(tx, nw.namespace, actual)
+			if blobsBkt := getBlobsBucket(tx, nw.namespace); blobsBkt != nil {
+				_ = blobsBkt.DeleteBucket([]byte(actual.String()))
+			}
+			nw.db.markUnavailableSecondaryImages(ctx, tx, nw.namespace)
+		}
 	} else {
 		status, err := nw.w.Status()
 		if err != nil {
@@ -687,10 +785,53 @@ func (nw *namespacedWriter) commit(ctx context.Context, tx *bolt.Tx, size int64,
 		}
 		size = status.Offset
 
-		if err := nw.w.Commit(ctx, size, expected); err != nil && !errdefs.IsAlreadyExists(err) {
-			return "", 0, err
+		wDigest := nw.w.Digest()
+		candidate := expected
+		if candidate == "" {
+			candidate = wDigest
 		}
-		actual = nw.w.Digest()
+		if candidate != "" {
+			if existing := getBlobBucket(tx, nw.namespace, candidate); existing != nil {
+				if !nw.db.isSecondaryBlobAvailable(ctx, existing, candidate) {
+					if hasSecondaryOrigin(existing) || len(existing.Get(bucketKeySourceRoot)) > 0 {
+						fromSecondary = true
+						_ = putContentOrigin(tx, nw.namespace, candidate)
+					}
+					deleteContentFromAllLeases(tx, nw.namespace, candidate)
+					if blobsBkt := getBlobsBucket(tx, nw.namespace); blobsBkt != nil {
+						_ = blobsBkt.DeleteBucket([]byte(candidate.String()))
+					}
+					nw.db.markUnavailableSecondaryImages(ctx, tx, nw.namespace)
+				} else if (expected == "" || expected == wDigest) && len(existing.Get(bucketKeySourceRoot)) > 0 {
+					nw.w.Close()
+					if im, ok := nw.provider.(content.IngestManager); ok {
+						_ = im.Abort(ctx, nw.bref)
+					}
+					return candidate, 0, fmt.Errorf("content %v: %w", candidate, errdefs.ErrAlreadyExists)
+				}
+			} else if (expected == "" || expected == wDigest) && !fromSecondary && nw.db.hasSecondaryRoots() && !isContentTombstoned(tx, nw.namespace, candidate) {
+				foundActive, sr := nw.db.findSharedContentSourceRoot(ctx, tx, candidate)
+				if !foundActive && sr == "" {
+					sr = nw.db.resolveBlobSourceRoot(candidate)
+				}
+				if sr != "" {
+					nw.w.Close()
+					if im, ok := nw.provider.(content.IngestManager); ok {
+						_ = im.Abort(ctx, nw.bref)
+					}
+					nw.w = nil
+					nw.sharedSourceRoot = sr
+					actual = candidate
+				}
+			}
+		}
+
+		if nw.w != nil {
+			if err := nw.w.Commit(ctx, size, expected); err != nil && !errdefs.IsAlreadyExists(err) {
+				return "", 0, err
+			}
+			actual = nw.w.Digest()
+		}
 	}
 
 	bkt, err := createBlobBucket(tx, nw.namespace, actual)
@@ -699,6 +840,20 @@ func (nw *namespacedWriter) commit(ctx context.Context, tx *bolt.Tx, size int64,
 			return actual, 0, fmt.Errorf("content %v: %w", actual, errdefs.ErrAlreadyExists)
 		}
 		return "", 0, err
+	}
+
+	if nw.w == nil && nw.sharedSourceRoot != "" {
+		if err := bkt.Put(bucketKeySourceRoot, []byte(nw.sharedSourceRoot)); err != nil {
+			return "", 0, err
+		}
+		fromSecondary = true
+	}
+
+	if clearContentTombstone(tx, nw.namespace, actual) || consumeContentOrigin(tx, nw.namespace, actual) || fromSecondary {
+		fromSecondary = true
+		if err := markFromSecondary(bkt); err != nil {
+			return "", 0, err
+		}
 	}
 
 	commitTime := time.Now().UTC()
@@ -714,7 +869,13 @@ func (nw *namespacedWriter) commit(ctx context.Context, tx *bolt.Tx, size int64,
 	if err := boltutil.WriteLabels(bkt, base.Labels); err != nil {
 		return "", 0, err
 	}
-	return actual, size, bkt.Put(bucketKeySize, sizeEncoded)
+	if err := bkt.Put(bucketKeySize, sizeEncoded); err != nil {
+		return "", 0, err
+	}
+	if nw.db.hasSecondaryRoots() && (fromSecondary || (hasGCRefLabel(base.Labels) && nw.db.findImageTreeSourceRoot(ctx, tx, nw.namespace, "", actual, false) != "")) {
+		nw.db.refreshNamespaceImageSourceRoots(ctx, tx, nw.namespace)
+	}
+	return actual, size, nil
 }
 
 func (nw *namespacedWriter) Status() (st content.Status, err error) {
@@ -751,11 +912,14 @@ func (cs *contentStore) checkAccess(ctx context.Context, dgst digest.Digest) err
 		if bkt == nil {
 			return fmt.Errorf("content digest %v: %w", dgst, errdefs.ErrNotFound)
 		}
+		if !cs.db.isSecondaryBlobAvailable(ctx, bkt, dgst) {
+			return fmt.Errorf("content digest %v: %w", dgst, errdefs.ErrNotFound)
+		}
 		return nil
 	})
 }
 
-func isSharedContent(tx *bolt.Tx, dgst digest.Digest) bool {
+func (cs *contentStore) isSharedContent(ctx context.Context, tx *bolt.Tx, dgst digest.Digest) bool {
 	v1bkt := tx.Bucket(bucketKeyVersion)
 	if v1bkt == nil {
 		return false
@@ -768,8 +932,10 @@ func isSharedContent(tx *bolt.Tx, dgst digest.Digest) bool {
 		if lbkt == nil {
 			continue
 		}
-		if sharedNS := lbkt.Get([]byte(labels.LabelSharedNamespace)); sharedNS != nil && string(sharedNS) == "true" && getBlobBucket(tx, ns, dgst) != nil {
-			return true
+		if sharedNS := lbkt.Get([]byte(labels.LabelSharedNamespace)); sharedNS != nil && string(sharedNS) == "true" {
+			if bkt := getBlobBucket(tx, ns, dgst); bkt != nil && cs.db.isSecondaryBlobAvailable(ctx, bkt, dgst) {
+				return true
+			}
 		}
 	}
 	return false
@@ -853,6 +1019,7 @@ func (cs *contentStore) garbageCollect(ctx context.Context) (d time.Duration, er
 	}()
 
 	contentSeen := map[string]struct{}{}
+	primarySeen := map[string]struct{}{}
 	ingestSeen := map[string]struct{}{}
 	if err := cs.db.View(func(tx *bolt.Tx) error {
 		v1bkt := tx.Bucket(bucketKeyVersion)
@@ -876,7 +1043,11 @@ func (cs *contentStore) garbageCollect(ctx context.Context) (d time.Duration, er
 			if bbkt != nil {
 				if err := bbkt.ForEach(func(ck, cv []byte) error {
 					if cv == nil {
-						contentSeen[string(ck)] = struct{}{}
+						key := string(ck)
+						contentSeen[key] = struct{}{}
+						if b := bbkt.Bucket(ck); b != nil && len(b.Get(bucketKeySourceRoot)) == 0 {
+							primarySeen[key] = struct{}{}
+						}
 					}
 					return nil
 				}); err != nil {
@@ -895,6 +1066,7 @@ func (cs *contentStore) garbageCollect(ctx context.Context) (d time.Duration, er
 						expected := bkt.Get(bucketKeyExpected)
 						if len(expected) > 0 {
 							contentSeen[string(expected)] = struct{}{}
+							primarySeen[string(expected)] = struct{}{}
 						}
 						bref := bkt.Get(bucketKeyRef)
 						if len(bref) > 0 {
@@ -913,7 +1085,7 @@ func (cs *contentStore) garbageCollect(ctx context.Context) (d time.Duration, er
 		return 0, err
 	}
 
-	err = cs.Store.Walk(ctx, func(info content.Info) error {
+	walkFn := func(info content.Info) error {
 		if _, ok := contentSeen[info.Digest.String()]; !ok {
 			if err := cs.Store.Delete(ctx, info.Digest); err != nil {
 				return err
@@ -921,7 +1093,35 @@ func (cs *contentStore) garbageCollect(ctx context.Context) (d time.Duration, er
 			log.G(ctx).WithField("digest", info.Digest).Debug("removed content")
 		}
 		return nil
-	})
+	}
+	type primaryContentStore interface {
+		WalkPrimary(context.Context, content.WalkFunc, ...string) error
+		DeletePrimary(context.Context, digest.Digest) error
+	}
+	if pcs, ok := cs.Store.(primaryContentStore); ok {
+		err = pcs.WalkPrimary(ctx, func(info content.Info) error {
+			key := info.Digest.String()
+			if _, ok := primarySeen[key]; !ok {
+				if _, seenInSec := contentSeen[key]; seenInSec {
+					if _, _, existsInSec := cs.db.inspectSecondaryRootBlob(info.Digest); !existsInSec {
+						return nil
+					}
+					if err := pcs.DeletePrimary(ctx, info.Digest); err != nil && !errdefs.IsNotFound(err) {
+						return err
+					}
+				} else if err := cs.Store.Delete(ctx, info.Digest); err != nil {
+					return err
+				}
+				log.G(ctx).WithField("digest", info.Digest).Debug("removed content")
+			}
+			return nil
+		})
+		if syncErr := cs.db.syncDeletedDigests(); err == nil && syncErr != nil {
+			err = syncErr
+		}
+	} else {
+		err = cs.Store.Walk(ctx, walkFn)
+	}
 	if err != nil {
 		return
 	}

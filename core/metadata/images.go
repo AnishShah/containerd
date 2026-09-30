@@ -47,6 +47,10 @@ func NewImageStore(db *DB) images.Store {
 	return &imageStore{db: db}
 }
 
+func (s *imageStore) HasSecondaryRoots() bool {
+	return s.db != nil && s.db.hasSecondaryRoots()
+}
+
 func (s *imageStore) Get(ctx context.Context, name string) (images.Image, error) {
 	var image images.Image
 
@@ -69,6 +73,9 @@ func (s *imageStore) Get(ctx context.Context, name string) (images.Image, error)
 		image.Name = name
 		if err := readImage(&image, ibkt); err != nil {
 			return fmt.Errorf("image %q: %w", name, err)
+		}
+		if !s.db.isSecondaryImageAvailable(ctx, tx, namespace, ibkt, image.Target.Digest) {
+			return fmt.Errorf("image %q: %w", name, errdefs.ErrNotFound)
 		}
 
 		return nil
@@ -97,6 +104,7 @@ func (s *imageStore) List(ctx context.Context, fs ...string) ([]images.Image, er
 			return nil // empty store
 		}
 
+		cache := newImageAvailCache()
 		return bkt.ForEach(func(k, v []byte) error {
 			var (
 				image = images.Image{
@@ -104,14 +112,21 @@ func (s *imageStore) List(ctx context.Context, fs ...string) ([]images.Image, er
 				}
 				kbkt = bkt.Bucket(k)
 			)
+			if kbkt == nil {
+				return nil
+			}
 
 			if err := readImage(&image, kbkt); err != nil {
 				return err
 			}
-
-			if filter.Match(adaptImage(image)) {
-				m = append(m, image)
+			if !filter.Match(adaptImage(image)) {
+				return nil
 			}
+			if !s.db.isSecondaryImageAvailableCached(ctx, tx, namespace, kbkt, image.Target.Digest, cache) {
+				return nil
+			}
+
+			m = append(m, image)
 			return nil
 		})
 	}); err != nil {
@@ -137,6 +152,17 @@ func (s *imageStore) Create(ctx context.Context, image images.Image) (images.Ima
 			return err
 		}
 
+		var fromSecondary bool
+		if existing := bkt.Bucket([]byte(image.Name)); existing != nil {
+			var prev images.Image
+			_ = readImage(&prev, existing)
+			if consumeImageOrigin(tx, namespace, image.Name) || !s.db.isSecondaryImageAvailable(ctx, tx, namespace, existing, prev.Target.Digest) {
+				fromSecondary = hasSecondaryOrigin(existing)
+				deleteImageFromAllLeases(tx, namespace, image.Name)
+				_ = bkt.DeleteBucket([]byte(image.Name))
+			}
+		}
+
 		if err := addImageLease(ctx, tx, image.Name, image.Labels); err != nil {
 			return err
 		}
@@ -148,6 +174,17 @@ func (s *imageStore) Create(ctx context.Context, image images.Image) (images.Ima
 			}
 
 			return fmt.Errorf("image %q: %w", image.Name, errdefs.ErrAlreadyExists)
+		}
+
+		if clearImageTombstone(tx, namespace, image.Name) || consumeImageOrigin(tx, namespace, image.Name) || fromSecondary {
+			if err := markFromSecondary(ibkt); err != nil {
+				return err
+			}
+		}
+		if sr := s.db.findImageTreeSourceRoot(ctx, tx, namespace, "", image.Target.Digest, false); sr != "" {
+			if err := ibkt.Put(bucketKeySourceRoot, []byte(sr)); err != nil {
+				return err
+			}
 		}
 
 		// The value of `image.CreatedAt` passed from the caller is discarded here.
@@ -187,7 +224,10 @@ func (s *imageStore) Update(ctx context.Context, image images.Image, fieldpaths 
 		return images.Image{}, fmt.Errorf("image name is required for update: %w", errdefs.ErrInvalidArgument)
 	}
 
-	var updated images.Image
+	var (
+		updated images.Image
+		rerr    error
+	)
 
 	if err := update(ctx, s.db, func(tx *bolt.Tx) error {
 		bkt, err := createImagesBucket(tx, namespace)
@@ -203,6 +243,7 @@ func (s *imageStore) Update(ctx context.Context, image images.Image, fieldpaths 
 		if err := readImage(&updated, ibkt); err != nil {
 			return fmt.Errorf("image %q: %w", image.Name, err)
 		}
+		prevDigest := updated.Target.Digest
 		createdat := updated.CreatedAt
 		updated.Name = image.Name
 
@@ -250,9 +291,49 @@ func (s *imageStore) Update(ctx context.Context, image images.Image, fieldpaths 
 			return err
 		}
 
+		if updated.Target.Digest != prevDigest {
+			if !s.db.isSecondaryImageAvailable(ctx, tx, namespace, ibkt, prevDigest) {
+				if hasSecondaryOrigin(ibkt) {
+					_ = putImageOrigin(tx, namespace, image.Name)
+				}
+				deleteImageFromAllLeases(tx, namespace, image.Name)
+				_ = bkt.DeleteBucket([]byte(image.Name))
+				rerr = fmt.Errorf("image %q: %w", image.Name, errdefs.ErrNotFound)
+				return nil
+			}
+			newSR := s.db.findImageTreeSourceRoot(ctx, tx, namespace, string(ibkt.Get(bucketKeySourceRoot)), updated.Target.Digest, true)
+			if newSR == "" {
+				_ = ibkt.Delete(bucketKeySourceRoot)
+			} else {
+				if err := ibkt.Put(bucketKeySourceRoot, []byte(newSR)); err != nil {
+					return err
+				}
+				if !s.db.isSecondaryImageAvailable(ctx, tx, namespace, ibkt, updated.Target.Digest) {
+					return fmt.Errorf("image %q: %w", image.Name, errdefs.ErrNotFound)
+				}
+			}
+		} else {
+			s.db.updateImageSourceRoot(ctx, tx, namespace, ibkt, updated.Target.Digest, true)
+			if !s.db.isSecondaryImageAvailable(ctx, tx, namespace, ibkt, updated.Target.Digest) {
+				if hasSecondaryOrigin(ibkt) {
+					_ = putImageOrigin(tx, namespace, image.Name)
+				}
+				deleteImageFromAllLeases(tx, namespace, image.Name)
+				_ = bkt.DeleteBucket([]byte(image.Name))
+				rerr = fmt.Errorf("image %q: %w", image.Name, errdefs.ErrNotFound)
+				return nil
+			}
+		}
+
 		// Collectible label may be added, if so add to lease
 		if err := addImageLease(ctx, tx, updated.Name, updated.Labels); err != nil {
 			return err
+		}
+
+		if clearImageTombstone(tx, namespace, updated.Name) || consumeImageOrigin(tx, namespace, updated.Name) {
+			if err := markFromSecondary(ibkt); err != nil {
+				return err
+			}
 		}
 
 		updated.CreatedAt = createdat
@@ -264,6 +345,9 @@ func (s *imageStore) Update(ctx context.Context, image images.Image, fieldpaths 
 		return writeImage(ibkt, &updated)
 	}); err != nil {
 		return images.Image{}, err
+	}
+	if rerr != nil {
+		return images.Image{}, rerr
 	}
 
 	if publisher := s.db.Publisher(ctx); publisher != nil {
@@ -298,16 +382,16 @@ func (s *imageStore) Delete(ctx context.Context, name string, opts ...images.Del
 			return fmt.Errorf("image %q: %w", name, errdefs.ErrNotFound)
 		}
 
+		ibkt := bkt.Bucket([]byte(name))
+		if ibkt == nil {
+			return fmt.Errorf("image %q: %w", name, errdefs.ErrNotFound)
+		}
+
 		if err := removeImageLease(ctx, tx, name); err != nil {
 			return err
 		}
 
 		if options.Target != nil && options.Target.Digest != "" {
-			ibkt := bkt.Bucket([]byte(name))
-			if ibkt == nil {
-				return fmt.Errorf("image %q: %w", name, errdefs.ErrNotFound)
-			}
-
 			var check images.Image
 			if err := readImage(&check, ibkt); err != nil {
 				return fmt.Errorf("image %q: %w", name, err)
@@ -318,11 +402,19 @@ func (s *imageStore) Delete(ctx context.Context, name string, opts ...images.Del
 			}
 		}
 
+		fromSecondary := hasSecondaryOrigin(ibkt)
+
 		if err = bkt.DeleteBucket([]byte(name)); err != nil {
 			if err == errbolt.ErrBucketNotFound {
 				err = fmt.Errorf("image %q: %w", name, errdefs.ErrNotFound)
 			}
 			return err
+		}
+
+		if fromSecondary {
+			if err := putImageTombstone(tx, namespace, name); err != nil {
+				return err
+			}
 		}
 
 		s.db.dirty.Add(1)

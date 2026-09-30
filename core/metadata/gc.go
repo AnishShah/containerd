@@ -27,6 +27,7 @@ import (
 
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/log"
+	digest "github.com/opencontainers/go-digest"
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/containerd/containerd/v2/pkg/gc"
@@ -1053,6 +1054,11 @@ func (c *gcContext) remove(ctx context.Context, tx *bolt.Tx, node gc.Node) (any,
 			cbkt = cbkt.Bucket(bucketKeyObjectBlob)
 		}
 		if cbkt != nil {
+			if b := cbkt.Bucket([]byte(node.Key)); hasSecondaryOrigin(b) {
+				if dgst, err := digest.Parse(node.Key); err == nil {
+					_ = putContentTombstone(tx, node.Namespace, dgst)
+				}
+			}
 			log.G(ctx).WithField("key", node.Key).Debug("remove content")
 			return nil, cbkt.DeleteBucket([]byte(node.Key))
 		}
@@ -1065,6 +1071,18 @@ func (c *gcContext) remove(ctx context.Context, tx *bolt.Tx, node gc.Node) (any,
 			}
 			ssbkt := sbkt.Bucket([]byte(ss))
 			if ssbkt != nil {
+				if b := ssbkt.Bucket([]byte(key)); b != nil {
+					if hasSecondaryOrigin(b) {
+						_ = putSnapshotTombstone(tx, node.Namespace, ss, key)
+					}
+					if parent := b.Get(bucketKeyParent); len(parent) > 0 {
+						if pbkt := ssbkt.Bucket(parent); pbkt != nil {
+							if chbkt := pbkt.Bucket(bucketKeyChildren); chbkt != nil {
+								_ = chbkt.Delete([]byte(key))
+							}
+						}
+					}
+				}
 				log.G(ctx).WithField("key", key).WithField("snapshotter", ss).Debug("remove snapshot")
 				return &eventstypes.SnapshotRemove{
 					Key:         key,
@@ -1075,6 +1093,9 @@ func (c *gcContext) remove(ctx context.Context, tx *bolt.Tx, node gc.Node) (any,
 	case ResourceImage:
 		ibkt := nsbkt.Bucket(bucketKeyObjectImages)
 		if ibkt != nil {
+			if b := ibkt.Bucket([]byte(node.Key)); hasSecondaryOrigin(b) {
+				_ = putImageTombstone(tx, node.Namespace, node.Key)
+			}
 			log.G(ctx).WithField("key", node.Key).Debug("remove image")
 			return &eventstypes.ImageDelete{
 				Name: node.Key,

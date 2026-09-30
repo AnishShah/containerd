@@ -889,12 +889,14 @@ func (c *CRIImageService) snapshotterFromPodSandboxConfig(ctx context.Context, i
 			annotations.RuntimeHandler)
 	}
 
+	c.runtimePlatformsMu.RLock()
 	if c.runtimePlatforms != nil {
 		if p, ok := c.runtimePlatforms[runtimeHandler]; ok && p.Snapshotter != snapshotter {
 			snapshotter = p.Snapshotter
 			log.G(ctx).Infof("experimental: PullImage %q for runtime %s, using snapshotter %s", imageRef, runtimeHandler, snapshotter)
 		}
 	}
+	c.runtimePlatformsMu.RUnlock()
 
 	return snapshotter, nil
 }

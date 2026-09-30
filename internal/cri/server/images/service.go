@@ -18,6 +18,9 @@ package images
 
 import (
 	"context"
+	"fmt"
+	"slices"
+	"sync"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -28,7 +31,9 @@ import (
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
 	snapshotstore "github.com/containerd/containerd/v2/internal/cri/store/snapshot"
+	"github.com/containerd/containerd/v2/internal/cri/util"
 	"github.com/containerd/containerd/v2/internal/kmutex"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"golang.org/x/sync/semaphore"
@@ -55,6 +60,8 @@ type CRIImageService struct {
 
 	// config contains all image configurations.
 	config criconfig.ImageConfig
+	// content is the lower level content store.
+	content content.Store
 	// images is the lower level image store used for raw storage,
 	// no event publishing should currently be assumed
 	images images.Store
@@ -63,12 +70,18 @@ type CRIImageService struct {
 	client imageClient
 	// imageFSPaths contains path to image filesystem for snapshotters.
 	imageFSPaths map[string]string
+	// runtimePlatformsMu protects runtimePlatforms.
+	runtimePlatformsMu sync.RWMutex
 	// runtimePlatforms are the platforms configured for a runtime.
 	runtimePlatforms map[string]ImagePlatform
 	// imageStore stores all resources associated with images.
 	imageStore *imagestore.Store
 	// snapshotStore stores information of all snapshots.
 	snapshotStore *snapshotstore.Store
+	// snapshotters stores the backend snapshotters by name.
+	snapshotters map[string]snapshots.Snapshotter
+	// allSnapshotters stores all available snapshotter plugins by name.
+	allSnapshotters map[string]snapshots.Snapshotter
 	// transferrer is used to pull image with transfer service
 	transferrer transfer.Transferrer
 	// unpackDuplicationSuppressor is used to make sure that there is only
@@ -95,6 +108,8 @@ type CRIImageServiceOptions struct {
 
 	Snapshotters map[string]snapshots.Snapshotter
 
+	AllSnapshotters map[string]snapshots.Snapshotter
+
 	Client imageClient
 
 	Transferrer transfer.Transferrer
@@ -117,12 +132,15 @@ func NewService(config criconfig.ImageConfig, options *CRIImageServiceOptions) (
 	}
 	svc := CRIImageService{
 		config:                      config,
+		content:                     options.Content,
 		images:                      options.Images,
 		client:                      options.Client,
 		imageStore:                  imagestore.NewStore(options.Images, options.Content, platforms.Default()),
 		imageFSPaths:                options.ImageFSPaths,
 		runtimePlatforms:            options.RuntimePlatforms,
 		snapshotStore:               snapshotstore.NewStore(),
+		snapshotters:                options.Snapshotters,
+		allSnapshotters:             options.AllSnapshotters,
 		transferrer:                 options.Transferrer,
 		unpackDuplicationSuppressor: kmutex.New(),
 		downloadLimiter:             downloadLimiter,
@@ -143,6 +161,8 @@ func NewService(config criconfig.ImageConfig, options *CRIImageServiceOptions) (
 // This is called by the main CRI plugin after both image and runtime plugins are initialized,
 // to propagate runtime-specific snapshotters configured in the runtime plugin's config.
 func (c *CRIImageService) UpdateRuntimeSnapshotter(runtimeName string, imagePlatform ImagePlatform) {
+	c.runtimePlatformsMu.Lock()
+	defer c.runtimePlatformsMu.Unlock()
 	if c.runtimePlatforms == nil {
 		c.runtimePlatforms = make(map[string]ImagePlatform)
 	}
@@ -158,9 +178,10 @@ func (c *CRIImageService) UpdateRuntimeSnapshotter(runtimeName string, imagePlat
 // LocalResolve resolves image reference locally and returns corresponding image metadata. It
 // returns errdefs.ErrNotFound if the reference doesn't exist.
 func (c *CRIImageService) LocalResolve(refOrID string) (imagestore.Image, error) {
+	var resolvedRef string
 	getImageID := func(refOrId string) string {
-		if _, err := imagedigest.Parse(refOrID); err == nil {
-			return refOrID
+		if _, err := imagedigest.Parse(refOrId); err == nil {
+			return refOrId
 		}
 		return func(ref string) string {
 			// ref is not image id, try to resolve it locally.
@@ -169,12 +190,13 @@ func (c *CRIImageService) LocalResolve(refOrID string) (imagestore.Image, error)
 			if err != nil {
 				return ""
 			}
-			id, err := c.imageStore.Resolve(normalized.String())
+			resolvedRef = normalized.String()
+			id, err := c.imageStore.Resolve(resolvedRef)
 			if err != nil {
 				return ""
 			}
 			return id
-		}(refOrID)
+		}(refOrId)
 	}
 
 	imageID := getImageID(refOrID)
@@ -182,7 +204,234 @@ func (c *CRIImageService) LocalResolve(refOrID string) (imagestore.Image, error)
 		// Try to treat ref as imageID
 		imageID = refOrID
 	}
-	return c.imageStore.Get(imageID)
+	img, err := c.imageStore.Get(imageID)
+	if err != nil {
+		return imagestore.Image{}, err
+	}
+	img, err = c.checkImageChainSnapshot(img)
+	if err != nil {
+		return imagestore.Image{}, err
+	}
+	if resolvedRef != "" && !slices.Contains(img.References, resolvedRef) {
+		return imagestore.Image{}, errdefs.ErrNotFound
+	}
+	return img, nil
+}
+
+func (c *CRIImageService) hasSecondaryRoots() bool {
+	type secondaryRootChecker interface {
+		HasSecondaryRoots() bool
+	}
+	if hsr, ok := c.content.(secondaryRootChecker); ok {
+		return hsr.HasSecondaryRoots()
+	}
+	if hsr, ok := c.images.(secondaryRootChecker); ok {
+		return hsr.HasSecondaryRoots()
+	}
+	hasSR := func(sn snapshots.Snapshotter) bool {
+		if sn == nil {
+			return false
+		}
+		if hsr, ok := sn.(secondaryRootChecker); ok && hsr.HasSecondaryRoots() {
+			return true
+		}
+		if srs, ok := sn.(interface{ SecondaryRoots() []string }); ok && len(srs.SecondaryRoots()) > 0 {
+			return true
+		}
+		return false
+	}
+	for _, sn := range c.snapshotters {
+		if hasSR(sn) {
+			return true
+		}
+	}
+	if len(c.allSnapshotters) > 0 {
+		c.runtimePlatformsMu.RLock()
+		defer c.runtimePlatformsMu.RUnlock()
+		for _, rp := range c.runtimePlatforms {
+			if _, inPrimary := c.snapshotters[rp.Snapshotter]; inPrimary {
+				continue
+			}
+			if hasSR(c.allSnapshotters[rp.Snapshotter]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (c *CRIImageService) listAvailableCRIImages() ([]*runtime.Image, error) {
+	imagesInStore := c.imageStore.List()
+	if !c.hasSecondaryRoots() || len(imagesInStore) == 0 {
+		out := make([]*runtime.Image, 0, len(imagesInStore))
+		for _, image := range imagesInStore {
+			out = append(out, toCRIImage(image))
+		}
+		return out, nil
+	}
+
+	var availableRefs map[string]struct{}
+	if c.images != nil {
+		listed, err := c.images.List(util.NamespacedContext())
+		if err != nil {
+			return nil, err
+		}
+		availableRefs = make(map[string]struct{}, len(listed))
+		for _, img := range listed {
+			availableRefs[img.Name] = struct{}{}
+		}
+	}
+
+	var out []*runtime.Image
+	for _, image := range imagesInStore {
+		checked, err := c.checkImageChainSnapshotWithRefs(image, availableRefs)
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, toCRIImage(checked))
+	}
+	return out, nil
+}
+
+func (c *CRIImageService) checkImageChainSnapshot(img imagestore.Image) (imagestore.Image, error) {
+	return c.checkImageChainSnapshotWithRefs(img, nil)
+}
+
+func (c *CRIImageService) checkImageChainSnapshotWithRefs(img imagestore.Image, availableRefs map[string]struct{}) (imagestore.Image, error) {
+	if !c.hasSecondaryRoots() {
+		return img, nil
+	}
+	ctx := util.NamespacedContext()
+	if c.images != nil && len(img.References) > 0 {
+		var (
+			validRefs    []string
+			staleRefs    []string
+			lastNotFound error
+		)
+		if availableRefs != nil {
+			for _, ref := range img.References {
+				if _, ok := availableRefs[ref]; ok {
+					validRefs = append(validRefs, ref)
+				} else {
+					staleRefs = append(staleRefs, ref)
+					lastNotFound = errdefs.ErrNotFound
+				}
+			}
+		} else if len(img.References) == 1 {
+			ref := img.References[0]
+			if _, err := c.images.Get(ctx, ref); err != nil {
+				if !errdefs.IsNotFound(err) {
+					return imagestore.Image{}, err
+				}
+				staleRefs = append(staleRefs, ref)
+				lastNotFound = err
+			} else {
+				validRefs = append(validRefs, ref)
+			}
+		} else {
+			fs := make([]string, len(img.References))
+			for i, ref := range img.References {
+				fs[i] = fmt.Sprintf("name==%q", ref)
+			}
+			listed, err := c.images.List(ctx, fs...)
+			if err != nil {
+				return imagestore.Image{}, err
+			}
+			found := make(map[string]struct{}, len(listed))
+			for _, li := range listed {
+				found[li.Name] = struct{}{}
+			}
+			for _, ref := range img.References {
+				if _, ok := found[ref]; ok {
+					validRefs = append(validRefs, ref)
+				} else {
+					staleRefs = append(staleRefs, ref)
+					lastNotFound = errdefs.ErrNotFound
+				}
+			}
+		}
+		if len(staleRefs) > 0 {
+			// Refresh the in-memory CRI image cache for any reference whose backing
+			// secondary-root image became unavailable without emitting an image delete event.
+			if c.imageStore != nil {
+				for _, ref := range staleRefs {
+					_ = c.imageStore.Update(ctx, ref)
+				}
+			}
+			if len(validRefs) == 0 && lastNotFound != nil {
+				return imagestore.Image{}, lastNotFound
+			}
+			img.References = validRefs
+		}
+	}
+	var runtimeSnapshotters []snapshots.Snapshotter
+	if len(c.allSnapshotters) > 0 {
+		c.runtimePlatformsMu.RLock()
+		seenRuntimeSn := make(map[string]struct{}, len(c.runtimePlatforms))
+		for _, rp := range c.runtimePlatforms {
+			if rp.Snapshotter == "" || rp.Snapshotter == c.config.Snapshotter {
+				continue
+			}
+			if _, inPrimary := c.snapshotters[rp.Snapshotter]; inPrimary {
+				continue
+			}
+			if _, seen := seenRuntimeSn[rp.Snapshotter]; seen {
+				continue
+			}
+			if sn := c.allSnapshotters[rp.Snapshotter]; sn != nil {
+				seenRuntimeSn[rp.Snapshotter] = struct{}{}
+				runtimeSnapshotters = append(runtimeSnapshotters, sn)
+			}
+		}
+		c.runtimePlatformsMu.RUnlock()
+	}
+	if (len(c.snapshotters) == 0 && len(runtimeSnapshotters) == 0) || img.ChainID == "" {
+		return img, nil
+	}
+	var lastErr error
+	if sn := c.snapshotters[c.config.Snapshotter]; sn != nil {
+		_, err := sn.Stat(ctx, img.ChainID)
+		if err == nil {
+			return img, nil
+		}
+		if !errdefs.IsNotFound(err) {
+			return imagestore.Image{}, err
+		}
+		lastErr = err
+	}
+	for name, otherSn := range c.snapshotters {
+		if name == c.config.Snapshotter || otherSn == nil {
+			continue
+		}
+		if _, otherErr := otherSn.Stat(ctx, img.ChainID); otherErr == nil {
+			return img, nil
+		} else if !errdefs.IsNotFound(otherErr) {
+			return imagestore.Image{}, otherErr
+		} else if lastErr == nil {
+			lastErr = otherErr
+		}
+	}
+	for _, otherSn := range runtimeSnapshotters {
+		if _, otherErr := otherSn.Stat(ctx, img.ChainID); otherErr == nil {
+			return img, nil
+		} else if !errdefs.IsNotFound(otherErr) {
+			return imagestore.Image{}, otherErr
+		} else if lastErr == nil {
+			lastErr = otherErr
+		}
+	}
+	if lastErr != nil {
+		if c.imageStore != nil && c.images != nil {
+			for _, ref := range img.References {
+				_ = c.imageStore.Update(ctx, ref)
+			}
+		}
+		return imagestore.Image{}, lastErr
+	}
+	return img, nil
 }
 
 // RuntimeSnapshotter overrides the default snapshotter if Snapshotter is set for this runtime.
@@ -199,7 +448,11 @@ func (c *CRIImageService) RuntimeSnapshotter(ctx context.Context, ociRuntime cri
 
 // GetImage gets image metadata by image id.
 func (c *CRIImageService) GetImage(id string) (imagestore.Image, error) {
-	return c.imageStore.Get(id)
+	img, err := c.imageStore.Get(id)
+	if err != nil {
+		return imagestore.Image{}, err
+	}
+	return c.checkImageChainSnapshot(img)
 }
 
 // GetSnapshot returns the snapshot with specified key.
